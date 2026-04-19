@@ -17,7 +17,7 @@
  * Self-contained.  All math inlined from bench_prime_funcs.c,
  * prime_pipeline.c, phi_mersenne_predictor.c.
  * No external dependencies beyond MSVCRT + kernel32.
- * No bcrypt.  No SHA.  No AES in the live kernel path.
+ * BCryptGenRandom used as mandatory entropy floor source in lattice init and lk_advance.
  * All cryptographic primitives are phi-lattice + wu-wei native.
  */
 
@@ -37,6 +37,8 @@
 #include <ctype.h>
 #include <intrin.h>   /* __rdtsc, __cpuid */
 #include <immintrin.h> /* AVX2/FMA: _mm256_*, _mm_* */
+#include <bcrypt.h>    /* BCryptGenRandom — OS CSPRNG (entropy floor guarantee) */
+#pragma comment(lib, "bcrypt.lib")
 
 /* ══════════════════════════ A. Constants ════════════════════════════════════ */
 
@@ -831,6 +833,19 @@ static void lattice_step(void) {
         lattice[i] = PHI * (lattice[i] + 1.0) - floor(PHI * (lattice[i] + 1.0));
 }
 
+/* Hardware RNG helper: compiled with rdseed+rdrnd target features.
+ * Tries RDSEED first (true hardware entropy), falls back to RDRAND.
+ * Returns 1 on success, 0 if neither instruction is available/successful.
+ * Marked with target attribute so callers need not be compiled with
+ * -mrdseed/-mrdrnd flags; clang/GCC will emit the correct ISA locally. */
+__attribute__((target("rdseed,rdrnd")))
+static int phi_hw_rng64(unsigned long long *out) {
+    unsigned long long v = 0;
+    for (int t = 0; t < 10; t++) { if (_rdseed64_step(&v)) { *out = v; v = 0; return 1; } }
+    for (int t = 0; t < 10; t++) { if (_rdrand64_step(&v)) { *out = v; v = 0; return 1; } }
+    return 0;
+}
+
 /*
  * lattice_seed_phi -- mirror of bootloader_init_lattice():
  *   slot[i] = frac(i * phi)  then advance `steps` resonance ticks.
@@ -878,6 +893,22 @@ static void lattice_seed_phi(int N, int steps) {
     volatile uint8_t sp4[4]; uintptr_t spa = (uintptr_t)(void*)sp4;
     for (int i = 0; i < 8; i++)
         ie[16 + i] = (uint8_t)((ie[16 + i] + (uint8_t)((spa >> (i * 8)) & 0xFF)) & 0xFF);
+    /* Src 5: BCryptGenRandom — OS CSPRNG (TPM / CPU RNG / kernel entropy pool).
+     * Guarantees 128-bit floor even when all timing sources are near-zero.
+     * Additive mix (Z/256Z): if BCrypt fails, other sources still contribute. */
+    {
+        uint8_t cng[32] = {0};
+        if (BCryptGenRandom(NULL, cng, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
+            for (int i = 0; i < 32; i++)
+                ie[i] = (uint8_t)((ie[i] + cng[i]) & 0xFF);
+        /* Src 6: RDSEED / RDRAND hardware RNG (Intel DRNG, independent of OS).
+         * Falls back to RDRAND if RDSEED unavailable. */
+        unsigned long long rds = 0;
+        if (phi_hw_rng64(&rds))
+            for (int i = 0; i < 8; i++)
+                ie[24 + i] = (uint8_t)((ie[24 + i] + (uint8_t)((rds >> (i * 8)) & 0xFF)) & 0xFF);
+        memset(cng, 0, 32); rds = 0;
+    }
     /* Inline phi-fold: mix ie[] into first 32 raw lattice bytes directly */
     uint8_t *lb = (uint8_t*)lattice;
     size_t rawcap = (size_t)N * sizeof(double);
@@ -4342,7 +4373,24 @@ static void lk_advance(void) {
         ent[24 + i] = (uint8_t)((ent[24 + i] + (uint8_t)((ha >> (i * 8)) & 0xFF)) & 0xFF);
     }
 
-    /* Condition all four sources: phi_fold(ent[32]) eliminates correlations. */
+    /* Src 5: BCryptGenRandom — OS CSPRNG (TPM / CPU RNG / kernel entropy pool).
+     * Guarantees 128-bit floor even when all timing sources are near-zero.
+     * Additive mix (Z/256Z): if BCrypt fails, other sources still contribute. */
+    {
+        uint8_t cng[32] = {0};
+        if (BCryptGenRandom(NULL, cng, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
+            for (int i = 0; i < 32; i++)
+                ent[i] = (uint8_t)((ent[i] + cng[i]) & 0xFF);
+        /* Src 6: RDSEED / RDRAND hardware RNG (Intel DRNG, independent of OS).
+         * Falls back to RDRAND if RDSEED unavailable. */
+        unsigned long long rds = 0;
+        if (phi_hw_rng64(&rds))
+            for (int i = 0; i < 8; i++)
+                ent[24 + i] = (uint8_t)((ent[24 + i] + (uint8_t)((rds >> (i * 8)) & 0xFF)) & 0xFF);
+        memset(cng, 0, 32); rds = 0;
+    }
+
+    /* Condition all six sources: phi_fold(ent[32]) eliminates correlations. */
     uint8_t phi_ent[32]; phi_fold_hash32(ent, 32, phi_ent);
     /* Mix additively into raw lattice bytes (Z/256Z, not XOR). */
     uint8_t *lb = (uint8_t*)lattice;
@@ -7114,7 +7162,7 @@ static void module_observer(void) {
         { "login_token",   "uid=1000 tok=phi-auth-v1 ts=1713484800"       },
         { "health_check",  "GET /health HTTP/1.1\r\nHost: phi-lattice\r\n" },
         { "log_line",      "[INFO] lk_advance epoch 42 ok ts=1713484801"   },
-        { "config_push",   "N=4096 steps=50 seed=0x1315ccefde4ba979"       },
+        { "config_push",   "N=4096 steps=50 seed=<runtime-derived>"        },
         { "metric_batch",  "\x00\x01\x02\x03\x04\x05\x06\x07"
                            "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"             },
         { "key_rotation",  "new_epoch_key phi_fold(lattice||seqno=43)"     },
