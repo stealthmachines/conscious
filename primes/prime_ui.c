@@ -1102,6 +1102,142 @@ static int lattice_derive_tmout(void) {
     return 300 + (int)(v * 3300);
 }
 
+/* ── Kernel sysctl params (slots 23-30) ─────────────────────────────────── */
+
+/* vm.swappiness: slot[23] → 0..100 */
+static int lattice_derive_swappiness(void) {
+    double v = (lattice_N > 23) ? lattice[23] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 101);
+}
+
+/* kernel.pid_max: slot[24] → 32768..4194304, aligned to 1024 */
+static int lattice_derive_pid_max(void) {
+    double v = (lattice_N > 24) ? lattice[24] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    int n = 32768 + (int)(v * 4161536);
+    return (n / 1024) * 1024;
+}
+
+/* vm.dirty_ratio: slot[25] → 5..40 */
+static int lattice_derive_dirty_ratio(void) {
+    double v = (lattice_N > 25) ? lattice[25] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return 5 + (int)(v * 36);
+}
+
+/* net.core.somaxconn: slot[26] → {128,256,512,1024,2048,4096,8192} */
+static int lattice_derive_somaxconn(void) {
+    static const int opts[] = { 128, 256, 512, 1024, 2048, 4096, 8192 };
+    double v = (lattice_N > 26) ? lattice[26] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return opts[(int)(v * 7)];
+}
+
+/* kernel.sched_min_granularity_ns: slot[27] → 100000..10000000 (100µs–10ms) */
+static int lattice_derive_sched_gran_ns(void) {
+    double v = (lattice_N > 27) ? lattice[27] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return 100000 + (int)(v * 9900000);
+}
+
+/* kernel.randomize_va_space: slot[28] → 0 (off), 1 (stack+VDSO), 2 (full ASLR) */
+static int lattice_derive_aslr(void) {
+    double v = (lattice_N > 28) ? lattice[28] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 3);
+}
+
+/* net.ipv4.tcp_rmem default: slot[29] → 4096..131072, aligned to 4096 */
+static int lattice_derive_tcp_rmem(void) {
+    double v = (lattice_N > 29) ? lattice[29] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    int n = 4096 + (int)(v * 126976);
+    return (n / 4096) * 4096;
+}
+
+/* net.ipv4.tcp_wmem default: slot[30] → 4096..131072, aligned to 4096 */
+static int lattice_derive_tcp_wmem(void) {
+    double v = (lattice_N > 30) ? lattice[30] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    int n = 4096 + (int)(v * 126976);
+    return (n / 4096) * 4096;
+}
+
+/* ── Kernel build CONFIG_* params (slots 31-40) ─────────────────────────── */
+
+/* CONFIG_HZ: slot[31] → {100, 250, 300, 1000} */
+static int lattice_derive_hz(void) {
+    static const int opts[] = { 100, 250, 300, 1000 };
+    double v = (lattice_N > 31) ? lattice[31] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return opts[(int)(v * 4)];
+}
+
+/* Preemption model: slot[32] → 0=NONE  1=VOLUNTARY  2=FULL */
+static int lattice_derive_preempt(void) {
+    double v = (lattice_N > 32) ? lattice[32] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 3);
+}
+
+/* Transparent Huge Pages: slot[33] → 0=always  1=madvise  2=never */
+static int lattice_derive_thp(void) {
+    double v = (lattice_N > 33) ? lattice[33] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 3);
+}
+
+/* Default TCP congestion: slot[34] → 0=cubic  1=reno  2=bbr */
+static int lattice_derive_tcp_cong(void) {
+    double v = (lattice_N > 34) ? lattice[34] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 3);
+}
+
+/* KASLR: slot[35] → 0=off  1=on */
+static int lattice_derive_kaslr(void) {
+    double v = (lattice_N > 35) ? lattice[35] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (v >= 0.5) ? 1 : 0;
+}
+
+/* AppArmor LSM: slot[36] → 0=off  1=on */
+static int lattice_derive_apparmor(void) {
+    double v = (lattice_N > 36) ? lattice[36] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (v >= 0.5) ? 1 : 0;
+}
+
+/* Btrfs: slot[37] → 0=n  1=module  2=built-in */
+static int lattice_derive_btrfs(void) {
+    double v = (lattice_N > 37) ? lattice[37] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 3);
+}
+
+/* ftrace / kernel tracing: slot[38] → 0=off  1=on */
+static int lattice_derive_ftrace(void) {
+    double v = (lattice_N > 38) ? lattice[38] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (v >= 0.5) ? 1 : 0;
+}
+
+/* Default CPU frequency governor: slot[39] → 0=performance 1=ondemand 2=conservative 3=powersave */
+static int lattice_derive_cpufreq_gov(void) {
+    double v = (lattice_N > 39) ? lattice[39] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 4);
+}
+
+/* NR_CPUS (max CPUs compiled in): slot[40] → {8,16,32,64,128,256,512,1024} */
+static int lattice_derive_nr_cpus(void) {
+    static const int opts[] = { 8, 16, 32, 64, 128, 256, 512, 1024 };
+    double v = (lattice_N > 40) ? lattice[40] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return opts[(int)(v * 8)];
+}
+
 /* ── File writers ───────────────────────────────────────────────────────── */
 
 /* Write all N slot double values as raw IEEE-754 bytes → entropy pool */
@@ -1132,6 +1268,14 @@ static void lattice_write_state_env(const char *path) {
     fprintf(f, "LATTICE_UMASK=%04o\n",          lattice_derive_umask());
     fprintf(f, "LATTICE_HISTSIZE=%d\n",         lattice_derive_histsize());
     fprintf(f, "LATTICE_TMOUT=%d\n",            lattice_derive_tmout());
+    fprintf(f, "LATTICE_SWAPPINESS=%d\n",       lattice_derive_swappiness());
+    fprintf(f, "LATTICE_PID_MAX=%d\n",          lattice_derive_pid_max());
+    fprintf(f, "LATTICE_DIRTY_RATIO=%d\n",      lattice_derive_dirty_ratio());
+    fprintf(f, "LATTICE_SOMAXCONN=%d\n",        lattice_derive_somaxconn());
+    fprintf(f, "LATTICE_SCHED_GRAN_NS=%d\n",    lattice_derive_sched_gran_ns());
+    fprintf(f, "LATTICE_ASLR=%d\n",             lattice_derive_aslr());
+    fprintf(f, "LATTICE_TCP_RMEM=%d\n",         lattice_derive_tcp_rmem());
+    fprintf(f, "LATTICE_TCP_WMEM=%d\n",         lattice_derive_tcp_wmem());
     /* all slot values */
     for (int i = 0; i < lattice_N; ++i)
         fprintf(f, "SLOT_%d=%.16f\n", i, lattice[i]);
@@ -1158,6 +1302,14 @@ static void lattice_write_init_sh(const char *sh_path,
     int  umask_val     = lattice_derive_umask();
     int  histsize_val  = lattice_derive_histsize();
     int  tmout_val     = lattice_derive_tmout();
+    int  swappiness    = lattice_derive_swappiness();
+    int  pid_max       = lattice_derive_pid_max();
+    int  dirty_ratio   = lattice_derive_dirty_ratio();
+    int  somaxconn     = lattice_derive_somaxconn();
+    int  sched_gran    = lattice_derive_sched_gran_ns();
+    int  aslr          = lattice_derive_aslr();
+    int  tcp_rmem      = lattice_derive_tcp_rmem();
+    int  tcp_wmem      = lattice_derive_tcp_wmem();
 
     fputs("#!/bin/sh\n"
           "# lattice_init.sh -- generated by Slot4096 resonance engine\n"
@@ -1170,6 +1322,60 @@ static void lattice_write_init_sh(const char *sh_path,
                "  dd if='%s' of=/dev/urandom bs=4096 2>/dev/null\n"
                "  echo \"[lattice] Entropy: $(wc -c < '%s') bytes -> /dev/urandom\"\n"
                "fi\n\n", ent_linux_path, ent_linux_path, ent_linux_path);
+
+    /* 1b. Kernel sysctl: derive from slots[23..30] → /etc/sysctl.d/99-lattice.conf */
+    fprintf(f, "# -- 1b. Kernel sysctl: slots[23..30] -> /etc/sysctl.d/99-lattice.conf --\n"
+               "mkdir -p /etc/sysctl.d\n"
+               "cat > /etc/sysctl.d/99-lattice.conf << 'EOSYSCTL'\n"
+               "vm.swappiness = %d\n"
+               "kernel.pid_max = %d\n"
+               "vm.dirty_ratio = %d\n"
+               "net.core.somaxconn = %d\n"
+               "kernel.sched_min_granularity_ns = %d\n"
+               "kernel.randomize_va_space = %d\n"
+               "net.ipv4.tcp_rmem = 4096 %d 16777216\n"
+               "net.ipv4.tcp_wmem = 4096 %d 16777216\n"
+               "EOSYSCTL\n"
+               "sysctl -w vm.swappiness=%d 2>/dev/null              && echo '[lattice] vm.swappiness=%d'\n"
+               "sysctl -w kernel.pid_max=%d 2>/dev/null             && echo '[lattice] kernel.pid_max=%d'\n"
+               "sysctl -w vm.dirty_ratio=%d 2>/dev/null             && echo '[lattice] vm.dirty_ratio=%d'\n"
+               "sysctl -w net.core.somaxconn=%d 2>/dev/null         && echo '[lattice] net.core.somaxconn=%d'\n"
+               "sysctl -w kernel.sched_min_granularity_ns=%d 2>/dev/null && echo '[lattice] sched_gran=%dns'\n"
+               "sysctl -w kernel.randomize_va_space=%d 2>/dev/null  && echo '[lattice] aslr=%d'\n"
+               "sysctl -w net.ipv4.tcp_rmem='4096 %d 16777216' 2>/dev/null && echo '[lattice] tcp_rmem=%d'\n"
+               "sysctl -w net.ipv4.tcp_wmem='4096 %d 16777216' 2>/dev/null && echo '[lattice] tcp_wmem=%d'\n\n",
+               swappiness, pid_max, dirty_ratio, somaxconn, sched_gran, aslr, tcp_rmem, tcp_wmem,
+               swappiness, swappiness,
+               pid_max,    pid_max,
+               dirty_ratio, dirty_ratio,
+               somaxconn,  somaxconn,
+               sched_gran, sched_gran,
+               aslr,       aslr,
+               tcp_rmem,   tcp_rmem,
+               tcp_wmem,   tcp_wmem);
+
+    /* 1c. Mount lattice-state ramfs at /run/lattice — in-memory phi-field state */
+    fprintf(f, "# -- 1c. ramfs: /run/lattice -> in-memory lattice state for all processes --\n"
+               "mkdir -p /run/lattice\n"
+               "mount -t ramfs -o size=1m ramfs /run/lattice 2>/dev/null\n"
+               "{\n"
+               "echo 'LATTICE_SEED=0x%016llx'\n"
+               "echo 'LATTICE_N=%d'\n"
+               "echo 'LATTICE_STEPS=%d'\n"
+               "echo 'LATTICE_HOST=%s'\n"
+               "echo 'LATTICE_SWAPPINESS=%d'\n"
+               "echo 'LATTICE_PID_MAX=%d'\n"
+               "echo 'LATTICE_DIRTY_RATIO=%d'\n"
+               "echo 'LATTICE_SOMAXCONN=%d'\n"
+               "echo 'LATTICE_SCHED_GRAN=%d'\n"
+               "echo 'LATTICE_ASLR=%d'\n"
+               "echo 'LATTICE_TCP_RMEM=%d'\n"
+               "echo 'LATTICE_TCP_WMEM=%d'\n"
+               "} > /run/lattice/state\n"
+               "chmod 444 /run/lattice/state\n"
+               "echo '[lattice] /run/lattice (ramfs) mounted — phi-field state live'\n\n",
+               (unsigned long long)seed, lattice_N, lattice_seed_steps_done, hostname,
+               swappiness, pid_max, dirty_ratio, somaxconn, sched_gran, aslr, tcp_rmem, tcp_wmem);
 
     /* 2. Hostname + /etc/hostname file */
     fprintf(f, "# -- 2. Hostname (phi-fold of slots[0..3]) --\n"
@@ -1228,6 +1434,14 @@ static void lattice_write_init_sh(const char *sh_path,
                "export LATTICE_UMASK=%04o\n"
                "export LATTICE_HISTSIZE=%d\n"
                "export LATTICE_TMOUT=%d\n"
+               "export LATTICE_SWAPPINESS=%d\n"
+               "export LATTICE_PID_MAX=%d\n"
+               "export LATTICE_DIRTY_RATIO=%d\n"
+               "export LATTICE_SOMAXCONN=%d\n"
+               "export LATTICE_SCHED_GRAN=%d\n"
+               "export LATTICE_ASLR=%d\n"
+               "export LATTICE_TCP_RMEM=%d\n"
+               "export LATTICE_TCP_WMEM=%d\n"
                "umask %04o\n"
                "ulimit -n %d 2>/dev/null\n"
                "export HISTSIZE=%d\n"
@@ -1240,6 +1454,8 @@ static void lattice_write_init_sh(const char *sh_path,
                hostname, mirror, tz,
                nice_val, uid_val, nofile_val,
                umask_val, histsize_val, tmout_val,
+               swappiness, pid_max, dirty_ratio, somaxconn,
+               sched_gran, aslr, tcp_rmem, tcp_wmem,
                umask_val, nofile_val,
                histsize_val, histsize_val * 2, tmout_val,
                hostname);
@@ -1252,6 +1468,8 @@ static void lattice_write_init_sh(const char *sh_path,
                "alias ll='ls -la'\n"
                "alias lattice='cat /lattice/state.env'\n"
                "alias slots='ls /lattice/slots/ | head -32'\n"
+               "alias kern='cat /run/lattice/state'\n"
+               "alias sysctl-lattice='sysctl vm.swappiness kernel.pid_max vm.dirty_ratio net.core.somaxconn kernel.randomize_va_space 2>/dev/null'\n"
                "export HISTFILE=/home/slot4096/.bash_history\n"
                "EOBASHRC\n"
                "cp /home/slot4096/.bashrc /home/slot4096/.bash_profile\n"
@@ -1303,6 +1521,7 @@ static void lattice_write_init_sh(const char *sh_path,
                "| tz   : %-20s                             |\n"
                "| user : slot4096  uid: %-5d  umask: %04o                     |\n"
                "| lim  : nofile=%-6d  hist=%-5d  tmout=%-4ds               |\n"
+               "| kern : swap=%-3d  pid_max=%-8d  conn=%-5d  aslr=%d       |\n"
                "| pkgs : %-52s |\n"
                "+--------------------------------------------------------------+\n"
                "EOMOTD\n\n",
@@ -1311,6 +1530,7 @@ static void lattice_write_init_sh(const char *sh_path,
                hostname, tz,
                uid_val, umask_val,
                nofile_val, histsize_val, tmout_val,
+               swappiness, pid_max, somaxconn, aslr,
                pkgs);
 
     /* 14. Activate and drop into slot4096 login shell */
@@ -1318,6 +1538,168 @@ static void lattice_write_init_sh(const char *sh_path,
           "cat /etc/motd\n"
           "echo '[lattice] OS fully initialised -- resonance substrate active'\n"
           "exec su - slot4096 -s /bin/bash 2>/dev/null || exec su - slot4096\n", f);
+
+    fclose(f);
+}
+
+/*
+ * Write the kernel build script (lattice_kbuild.sh).
+ * This runs inside a --privileged Alpine container and:
+ *   - installs toolchain
+ *   - downloads a minimal Linux 6.6 LTS source
+ *   - generates .config from defconfig + lattice CONFIG_* overrides
+ *   - starts make in the background, logs to /output/kernel_build.log
+ *   - copies vmlinuz + .config to /output/ when done
+ */
+static void lattice_write_kbuild_sh(const char *path) {
+    static const char *hz_str[]     = { "100", "250", "300", "1000" };
+    static const char *preempt_str[]= { "PREEMPT_NONE", "PREEMPT_VOLUNTARY", "PREEMPT" };
+    static const char *thp_str[]    = { "always", "madvise", "never" };
+    static const char *cong_str[]   = { "cubic", "reno", "bbr" };
+    static const char *gov_str[]    = { "performance", "ondemand", "conservative", "powersave" };
+    static const char *btrfs_opt[]  = { "n", "m", "y" };
+
+    int hz       = lattice_derive_hz();
+    int preempt  = lattice_derive_preempt();
+    int thp      = lattice_derive_thp();
+    int cong     = lattice_derive_tcp_cong();
+    int kaslr    = lattice_derive_kaslr();
+    int apparmor = lattice_derive_apparmor();
+    int btrfs    = lattice_derive_btrfs();
+    int ftrace   = lattice_derive_ftrace();
+    int gov      = lattice_derive_cpufreq_gov();
+    int nr_cpus  = lattice_derive_nr_cpus();
+    uint64_t seed = lattice_derive_seed();
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+
+    fprintf(f, "#!/bin/sh\n"
+               "# lattice_kbuild.sh -- Slot4096 lattice-native kernel build\n"
+               "# seed: 0x%016llx  slots: %d  steps: %d\n"
+               "# CONFIG_* values derived from lattice slots 31-40\n\n",
+               (unsigned long long)seed, lattice_N, lattice_seed_steps_done);
+
+    /* Install toolchain */
+    fputs("echo '[kbuild] Installing toolchain...'\n"
+          "apk add -q gcc make perl flex bison elfutils-dev openssl-dev bc \\\n"
+          "    linux-headers ncurses-dev wget xz tar 2>/dev/null\n\n", f);
+
+    /* Download Linux 6.6 LTS */
+    fputs("echo '[kbuild] Downloading Linux 6.6 LTS source...'\n"
+          "mkdir -p /build\n"
+          "cd /build\n"
+          "wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz \\\n"
+          "  || { echo '[kbuild] ERROR: download failed'; exit 1; }\n"
+          "echo '[kbuild] Extracting...'\n"
+          "tar xf linux-6.6.tar.xz\n"
+          "cd linux-6.6\n\n", f);
+
+    /* defconfig baseline */
+    fputs("echo '[kbuild] Generating defconfig baseline...'\n"
+          "make defconfig 2>/dev/null\n\n", f);
+
+    /* Apply lattice CONFIG_* overrides */
+    fprintf(f, "echo '[kbuild] Applying lattice CONFIG_* overrides (seed 0x%016llx)...'\n",
+            (unsigned long long)seed);
+
+    /* CONFIG_HZ */
+    fprintf(f, "scripts/config --set-val CONFIG_HZ %s\n"
+               "scripts/config --enable  CONFIG_HZ_%s\n", hz_str[lattice_derive_hz()==100?0:lattice_derive_hz()==250?1:lattice_derive_hz()==300?2:3], hz_str[lattice_derive_hz()==100?0:lattice_derive_hz()==250?1:lattice_derive_hz()==300?2:3]);
+
+    /* Preemption */
+    if (preempt == 0)
+        fputs("scripts/config --enable CONFIG_PREEMPT_NONE\n"
+              "scripts/config --disable CONFIG_PREEMPT_VOLUNTARY\n"
+              "scripts/config --disable CONFIG_PREEMPT\n", f);
+    else if (preempt == 1)
+        fputs("scripts/config --disable CONFIG_PREEMPT_NONE\n"
+              "scripts/config --enable  CONFIG_PREEMPT_VOLUNTARY\n"
+              "scripts/config --disable CONFIG_PREEMPT\n", f);
+    else
+        fputs("scripts/config --disable CONFIG_PREEMPT_NONE\n"
+              "scripts/config --disable CONFIG_PREEMPT_VOLUNTARY\n"
+              "scripts/config --enable  CONFIG_PREEMPT\n", f);
+
+    /* THP */
+    fprintf(f, "scripts/config --set-str CONFIG_TRANSPARENT_HUGEPAGE_MADVISE %s\n", thp_str[thp]);
+
+    /* TCP congestion */
+    fprintf(f, "scripts/config --set-str CONFIG_DEFAULT_TCP_CONG %s\n", cong_str[cong]);
+    if (cong == 2) /* bbr */
+        fputs("scripts/config --enable CONFIG_TCP_CONG_BBR\n", f);
+
+    /* KASLR */
+    if (kaslr)
+        fputs("scripts/config --enable CONFIG_RANDOMIZE_BASE\n", f);
+    else
+        fputs("scripts/config --disable CONFIG_RANDOMIZE_BASE\n", f);
+
+    /* AppArmor */
+    if (apparmor)
+        fputs("scripts/config --enable CONFIG_SECURITY_APPARMOR\n"
+              "scripts/config --set-str CONFIG_LSM 'lockdown,yama,apparmor,bpf'\n", f);
+    else
+        fputs("scripts/config --disable CONFIG_SECURITY_APPARMOR\n", f);
+
+    /* Btrfs */
+    fprintf(f, "scripts/config --%s CONFIG_BTRFS_FS\n",
+            btrfs == 0 ? "disable" : btrfs == 1 ? "module" : "enable");
+
+    /* ftrace */
+    if (ftrace)
+        fputs("scripts/config --enable CONFIG_FTRACE\n"
+              "scripts/config --enable CONFIG_FUNCTION_TRACER\n", f);
+    else
+        fputs("scripts/config --disable CONFIG_FTRACE\n", f);
+
+    /* CPU freq governor */
+    fprintf(f, "scripts/config --set-str CONFIG_CPU_FREQ_DEFAULT_GOV_%s y\n",
+            gov_str[gov]);
+
+    /* NR_CPUS */
+    fprintf(f, "scripts/config --set-val CONFIG_NR_CPUS %d\n", nr_cpus);
+
+    /* Finalize config */
+    fputs("\nmake olddefconfig 2>/dev/null\n"
+          "echo '[kbuild] Lattice .config written to /build/linux-6.6/.config'\n"
+          "cp .config /output/lattice-kernel.config\n\n", f);
+
+    /* Print the lattice config summary */
+    fprintf(f, "echo ''\n"
+               "echo '+------------------------------------------+'\n"
+               "echo '| Lattice-Native Kernel Config             |'\n"
+               "echo '| seed : 0x%016llx     |'\n"
+               "echo '| HZ   : %-4s  preempt: %-9s  NR_CPUS: %-4d |'\n"
+               "echo '| THP  : %-8s  tcp_cong: %-12s      |'\n"
+               "echo '| KASLR: %-3s  apparmor: %-3s  btrfs: %-3s      |'\n"
+               "echo '| ftrace: %-3s  cpufreq: %-13s         |'\n"
+               "echo '+------------------------------------------+'\n"
+               "echo ''\n\n",
+               (unsigned long long)seed,
+               hz_str[lattice_derive_hz()==100?0:lattice_derive_hz()==250?1:lattice_derive_hz()==300?2:3],
+               preempt_str[preempt], nr_cpus,
+               thp_str[thp], cong_str[cong],
+               kaslr ? "on" : "off", apparmor ? "on" : "off", btrfs_opt[btrfs],
+               ftrace ? "on" : "off", gov_str[gov]);
+
+    /* Start background build */
+    fprintf(f, "echo '[kbuild] Starting kernel build (nproc=$(nproc) threads)...'\n"
+               "echo '[kbuild] Log: /output/kernel_build.log'\n"
+               "echo '[kbuild] Monitor: tail -f /output/kernel_build.log'\n"
+               "echo '[kbuild] Output:  /output/vmlinuz'\n\n"
+               "make -j$(nproc) 2>&1 | tee /output/kernel_build.log\n"
+               "BUILD_RC=$?\n"
+               "if [ $BUILD_RC -eq 0 ]; then\n"
+               "  cp arch/x86/boot/bzImage /output/vmlinuz 2>/dev/null || true\n"
+               "  echo '[kbuild] === BUILD COMPLETE ==='\n"
+               "  echo '[kbuild] vmlinuz -> /output/vmlinuz'\n"
+               "  echo '[kbuild] config  -> /output/lattice-kernel.config'\n"
+               "  echo '[kbuild] Boot with QEMU:'\n"
+               "  echo '  qemu-system-x86_64 -kernel /output/vmlinuz -append console=ttyS0'\n"
+               "else\n"
+               "  echo '[kbuild] === BUILD FAILED (rc='$BUILD_RC') ==='\n"
+               "fi\n");
 
     fclose(f);
 }
@@ -1350,6 +1732,14 @@ static void module_alpine_os(void) {
     int  umask_val     = lattice_derive_umask();
     int  histsize_val  = lattice_derive_histsize();
     int  tmout_val     = lattice_derive_tmout();
+    int  swappiness    = lattice_derive_swappiness();
+    int  pid_max       = lattice_derive_pid_max();
+    int  dirty_ratio   = lattice_derive_dirty_ratio();
+    int  somaxconn     = lattice_derive_somaxconn();
+    int  sched_gran    = lattice_derive_sched_gran_ns();
+    int  aslr          = lattice_derive_aslr();
+    int  tcp_rmem      = lattice_derive_tcp_rmem();
+    int  tcp_wmem      = lattice_derive_tcp_wmem();
 
     printf("  " BOLD "Lattice-derived OS configuration:" CR "\n");
     printf("    Hostname  : " GRN "%s" CR "\n",     hostname);
@@ -1362,6 +1752,15 @@ static void module_alpine_os(void) {
     printf("    ulimit -n : " GRN "%d" CR "\n",     nofile_val);
     printf("    HISTSIZE  : " GRN "%d" CR "\n",     histsize_val);
     printf("    TMOUT     : " GRN "%ds" CR "\n",    tmout_val);
+    printf("  " BOLD "  -- kernel sysctl (slots 23-30) --" CR "\n");
+    printf("    swappiness: " GRN "%d" CR "\n",     swappiness);
+    printf("    pid_max   : " GRN "%d" CR "\n",     pid_max);
+    printf("    dirty_ratio: " GRN "%d" CR "\n",    dirty_ratio);
+    printf("    somaxconn : " GRN "%d" CR "\n",     somaxconn);
+    printf("    sched_gran: " GRN "%dns" CR "\n",   sched_gran);
+    printf("    aslr      : " GRN "%d" CR "\n",     aslr);
+    printf("    tcp_rmem  : " GRN "4096/%d/16777216" CR "\n", tcp_rmem);
+    printf("    tcp_wmem  : " GRN "4096/%d/16777216" CR "\n", tcp_wmem);
     printf("    Entropy   : " GRN "%d slots × 8 bytes = %d bytes" CR "\n",
            lattice_N, lattice_N * 8);
     printf("    Seed      : " GRN "0x%016llx" CR "\n\n", (unsigned long long)seed);
@@ -1517,7 +1916,7 @@ static void module_alpine_os(void) {
             char dcmd[2048];
             snprintf(dcmd, sizeof(dcmd),
                 "docker run -it --name phi4096-lattice "
-                "--cap-add SYS_ADMIN "
+                "--cap-add SYS_ADMIN --cap-add NET_ADMIN "
                 "-e LATTICE_N=%d -e LATTICE_STEPS=%d "
                 "-e LATTICE_SEED=0x%016llx -e LATTICE_INSTALLED=%d "
                 "-v \"%s:/lattice/init.sh:ro\" "
@@ -1632,8 +2031,114 @@ static void print_banner(void) {
         CR "\n");
 }
 
+static void module_kernel_build(void) {
+    static const char *hz_str[]     = { "100", "250", "300", "1000" };
+    static const char *preempt_str[]= { "NONE", "VOLUNTARY", "FULL" };
+    static const char *thp_str[]    = { "always", "madvise", "never" };
+    static const char *cong_str[]   = { "cubic", "reno", "bbr" };
+    static const char *gov_str[]    = { "performance", "ondemand", "conservative", "powersave" };
+    static const char *btrfs_str[]  = { "n", "module", "built-in" };
+
+    int hz       = lattice_derive_hz();
+    int preempt  = lattice_derive_preempt();
+    int thp      = lattice_derive_thp();
+    int cong     = lattice_derive_tcp_cong();
+    int kaslr    = lattice_derive_kaslr();
+    int apparmor = lattice_derive_apparmor();
+    int btrfs    = lattice_derive_btrfs();
+    int ftrace   = lattice_derive_ftrace();
+    int gov      = lattice_derive_cpufreq_gov();
+    int nr_cpus  = lattice_derive_nr_cpus();
+    uint64_t seed = lattice_derive_seed();
+
+    printf("\n" CYAN
+        "+--------------------------------------------------------------+\n"
+        "|  Kernel Build  --  Slot4096 Lattice-Native Linux Kernel     |\n"
+        "+--------------------------------------------------------------+\n"
+        CR "\n");
+
+    printf("  " BOLD "Lattice-derived kernel CONFIG_* (slots 31-40):" CR "\n");
+    printf("    CONFIG_HZ            : " GRN "%s" CR "\n",
+           hz_str[hz==100?0:hz==250?1:hz==300?2:3]);
+    printf("    Preemption           : " GRN "%s" CR "\n",   preempt_str[preempt]);
+    printf("    CONFIG_NR_CPUS       : " GRN "%d" CR "\n",   nr_cpus);
+    printf("    THP                  : " GRN "%s" CR "\n",   thp_str[thp]);
+    printf("    TCP congestion       : " GRN "%s" CR "\n",   cong_str[cong]);
+    printf("    KASLR                : " GRN "%s" CR "\n",   kaslr ? "on" : "off");
+    printf("    AppArmor             : " GRN "%s" CR "\n",   apparmor ? "on" : "off");
+    printf("    Btrfs                : " GRN "%s" CR "\n",   btrfs_str[btrfs]);
+    printf("    ftrace               : " GRN "%s" CR "\n",   ftrace ? "on" : "off");
+    printf("    Default cpufreq gov  : " GRN "%s" CR "\n",   gov_str[gov]);
+    printf("    Seed                 : " GRN "0x%016llx" CR "\n\n",
+           (unsigned long long)seed);
+
+    printf("  " DIM "Source: Linux 6.6 LTS (cdn.kernel.org)\n"
+           "  Build:  make -j$(nproc) inside privileged Alpine container\n"
+           "  Output: .\\lattice_kbuild\\vmlinuz  +  lattice-kernel.config\n"
+           "  Boot:   qemu-system-x86_64 -kernel lattice_kbuild/vmlinuz\n" CR "\n");
+
+    if (!lattice_alpine_installed)
+        printf("  " YEL "[warn] Run Alpine Install [6] first to seed the lattice.\n" CR "\n");
+
+    printf("  " BOLD "Start lattice-native kernel build? [y/N] " CR);
+    fflush(stdout);
+
+    DWORD old2; GetConsoleMode(g_hin, &old2);
+    SetConsoleMode(g_hin, ENABLE_PROCESSED_INPUT|ENABLE_ECHO_INPUT|ENABLE_LINE_INPUT);
+    WCHAR wb2[8] = {0}; DWORD nr2 = 0;
+    ReadConsoleW(g_hin, wb2, 7, &nr2, NULL);
+    SetConsoleMode(g_hin, old2);
+    char ch2 = (wb2[0] > 0 && wb2[0] <= 127) ? (char)wb2[0] : 'n';
+    if (ch2 != 'y' && ch2 != 'Y') {
+        printf("  " DIM "Aborted.\n" CR "\n");
+        return;
+    }
+
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+
+    char kbuild_dir[MAX_PATH], kbuild_sh[MAX_PATH];
+    snprintf(kbuild_dir, sizeof(kbuild_dir), "%s\\lattice_kbuild", cwd);
+    snprintf(kbuild_sh,  sizeof(kbuild_sh),  "%s\\lattice_kbuild.sh", cwd);
+
+    char mkdir_cmd[MAX_PATH + 32];
+    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir \"%s\" >nul 2>nul", kbuild_dir);
+    system(mkdir_cmd);
+
+    lattice_write_kbuild_sh(kbuild_sh);
+
+    char docker_sh[MAX_PATH], docker_out[MAX_PATH];
+    snprintf(docker_sh,  sizeof(docker_sh),  "%s", kbuild_sh);
+    snprintf(docker_out, sizeof(docker_out), "%s", kbuild_dir);
+    for (char *p = docker_sh;  *p; p++) if (*p == '\\') *p = '/';
+    for (char *p = docker_out; *p; p++) if (*p == '\\') *p = '/';
+
+    system("docker rm -f phi4096-kbuild >nul 2>nul");
+
+    char dcmd[2048];
+    snprintf(dcmd, sizeof(dcmd),
+        "docker run -it --name phi4096-kbuild --privileged "
+        "-e LATTICE_SEED=0x%016llx -e LATTICE_N=%d -e LATTICE_STEPS=%d "
+        "-v \"%s:/kbuild/build.sh:ro\" "
+        "-v \"%s:/output\" "
+        "-w /kbuild alpine sh /kbuild/build.sh",
+        (unsigned long long)seed, lattice_N, lattice_seed_steps_done,
+        docker_sh, docker_out);
+
+    printf("\n  " CYAN "Launching privileged kernel build container...\n"
+           "  " YEL  "Container: phi4096-kbuild\n"
+           "  " YEL  "Output:    %s\n"
+           "  " DIM  "30-90+ min. Monitor: docker exec phi4096-kbuild tail -f /output/kernel_build.log\n"
+           CR "\n", kbuild_dir);
+    fflush(stdout);
+
+    system(dcmd);
+    system("docker rm phi4096-kbuild >nul 2>nul");
+
+    printf("\n  " GRN "Build container exited. Output in: %s\n" CR "\n", kbuild_dir);
+}
+
 static void print_menu(void) {
-    /* Check if the lattice container is currently running */
     int live = 0;
     {
         FILE *cp = _popen("docker inspect --format={{.State.Status}} phi4096-lattice 2>NUL", "r");
@@ -1656,6 +2161,7 @@ static void print_menu(void) {
         printf("  " YEL "[8]" CR " Alpine OS Shell      " GRN "[live: phi4096-lattice]" CR " re-attach\n");
     else
         printf("  " YEL "[8]" CR " Alpine OS Shell      spawn lattice-powered Alpine Linux\n");
+    printf("  " YEL "[9]" CR " Kernel Build         compile lattice-native Linux kernel\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -1683,7 +2189,8 @@ int main(void) {
         case '5': module_benchmark(); break;
         case '6': module_alpine();    break;
         case '7': module_lattice_shell(); break;
-        case '8': module_alpine_os();     break;
+        case '8': module_alpine_os();       break;
+        case '9': module_kernel_build();     break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;

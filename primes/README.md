@@ -6,6 +6,275 @@
 
 GPU target: **RTX 2060 12 GB** (CUDA sm_75).  Folder: `primes/`.
 
+---
+
+## Simple Guide
+
+### What It Is
+
+**conscious** is a Windows-native prime-research workbench with three interlocking layers:
+
+1. **`prime_ui.exe`** — A full-screen TUI (8 modules) for prime mathematics: pipeline
+   sieve, Mersenne LL verifier, zeta-zero viewer, phi-lattice explorer, and a
+   live Alpine Linux shell — all driven from one keyboard menu.
+
+2. **`conscious.exe`** — The CUDA GPU engine.  Runs dual-slot λₖ–σ spectral resonance
+   (Markov trit gating) and schoolbook warp-parallel squaring for Lucas-Lehmer
+   verification on sm_75 hardware.
+
+3. **Slot4096 Alpine OS** — A Docker container whose *entire configuration* —
+   hostname, packages, timezone, user UID, shell limits, ulimits — is derived
+   deterministically from a single 4096-slot phi-irrational lattice.  No config
+   files, no cloud provisioning — just math.
+
+---
+
+### Quick Start
+
+**Prerequisites:** MSYS2/clang, CUDA toolkit (sm_75), MSVC 2017+, Docker Desktop.
+
+#### 1. Build the TUI
+
+```bat
+cmd /c build_prime_ui.bat
+```
+Expected: `[OK] Built: prime_ui.exe`
+
+#### 2. Build the GPU engine (optional, needs CUDA)
+
+```bat
+cmd /c build_conscious.bat
+```
+
+#### 3. Run
+
+```bat
+.\prime_ui.exe
+```
+
+#### 4. First-time Alpine setup — menu `[6]`
+
+Select **[6] Alpine OS Install** from the main menu.  This:
+- Seeds the 4096-slot phi-lattice (50 Weyl resonance steps)
+- Derives all OS parameters from lattice slots 0–22
+- Writes `lattice_init.sh`, `lattice_entropy.bin`, `lattice_state.env` to the
+  current directory
+- Prints the full derived OS manifest (hostname, mirror, packages, tz, uid…)
+
+#### 5. Launch the lattice-powered container — menu `[8]`
+
+Select **[8] Alpine OS Shell**.
+
+- If no container exists → boots a fresh Alpine instance using `docker run`,
+  runs the 14-step `lattice_init.sh` inside it, and drops you into a
+  `slot4096@phi4096-XXXXXXXX:~$` prompt.
+- If the container is already running (shown as `[live: phi4096-lattice]` in the
+  menu) → re-attaches instantly with `docker exec`.
+
+#### 6. Detach without stopping
+
+```
+Ctrl-P  Ctrl-Q
+```
+
+The container keeps running.  Menu `[8]` will show the live badge and re-attach
+on the next selection.
+
+#### 7. Stop the container
+
+```sh
+# inside the container
+exit
+```
+The `docker rm` cleanup runs automatically after `prime_ui` regains control.
+
+---
+
+### How It Works
+
+```
+prime_ui.exe
+    │
+    ├─[1-5,7]  Pure-C prime math (sieve, LL, zeta, benchmark)
+    │
+    └─[6] Alpine Install
+           │
+           ├── lattice_seed()          seed[0..4095] = φ-Weyl irrational spacing
+           ├── 50× resonance steps     Kuramoto-style slot coupling
+           ├── lattice_derive_*()      slots[0..22] → hostname/mirror/pkgs/tz/uid/…
+           ├── write lattice_init.sh   14-step Alpine boot script (Unix LF, "wb")
+           ├── write lattice_entropy.bin  32 KB of lattice-derived entropy
+           └── write lattice_state.env    KEY=VALUE for env passthrough
+
+       [8] Alpine OS Shell
+           │
+           ├── docker inspect phi4096-lattice   → running? exists?
+           ├── if running  → docker exec -it … su - slot4096
+           └── if not      → docker run -it --name phi4096-lattice
+                               --cap-add SYS_ADMIN
+                               -e LATTICE_N / LATTICE_STEPS / LATTICE_SEED
+                               -v lattice_init.sh:/lattice/init.sh:ro
+                               -v lattice_entropy.bin:/lattice/entropy.bin:ro
+                               -v lattice_state.env:/lattice/state.env:ro
+                               alpine sh /lattice/init.sh
+```
+
+Inside the container `lattice_init.sh` runs 14 ordered steps:
+
+| Step | Action |
+|------|--------|
+| 1 | Set hostname from `LATTICE_SEED` derivation |
+| 2 | Select APK mirror (one of 8 CDN choices, slot[4]) |
+| 3 | `apk update` |
+| 4 | Install lattice-selected packages (slots[5..15] bit-select from 11 candidates) |
+| 5 | Set timezone (slot[16] → UTC offset) |
+| 6 | Create user `slot4096` with lattice-derived UID (slot[18] → 1000–9999) |
+| 7 | Set `nice` priority (slot[17] → −20..+19) |
+| 8 | Write `/etc/profile.d/lattice.sh` (ulimit/umask/HISTSIZE/TMOUT from slots[19..22]) |
+| 9 | Write `/etc/motd` — 64-char ANSI box with seed, slots, hostname |
+| 10 | Write `/etc/issue` — seed + parameters banner |
+| 11 | Write `/home/slot4096/.profile` (sources `/etc/profile.d/lattice.sh`) |
+| 12 | Verify packages are present (`command -v`) |
+| 13 | Print final confirmation lines |
+| 14 | `su - slot4096` → interactive shell |
+
+---
+
+### Under the Hood
+
+#### Phi-Weyl Lattice Seeding
+
+The lattice is seeded by irrational Weyl spacing — the fractional parts of
+`k·φ` (golden ratio, φ ≈ 1.6180339887) for k = 1..4096.  Because φ is
+maximally irrational, successive values never cluster; the 4096-slot array
+covers [0,1) almost uniformly.  After seeding, 50 Kuramoto-style coupling
+steps diffuse entropy across all slots so local structure dissolves.
+
+The seed extracted for Docker env-vars is a 64-bit XOR-fold over slots[0..63].
+
+#### Slot → OS Parameter Derivation
+
+Each OS parameter is a pure function of one or more lattice slots:
+
+| Parameter | Slots | Method |
+|-----------|-------|--------|
+| Hostname suffix | 0–3 | XOR-fold → 8 hex chars |
+| APK mirror | 4 | `floor(slot*8)` → index into 8 CDN strings |
+| Package list | 5–15 | bit `i` set if `slot[5+i] > 0.5` |
+| Timezone | 16 | `floor(slot*25)−12` → `Etc/GMT±n` |
+| nice | 17 | `floor(slot*40)−20` |
+| UID | 18 | `1000 + floor(slot*9000)` |
+| ulimit -n | 19 | `1024 + floor(slot*64512)` |
+| umask | 20 | index into `{002,007,022,027}` |
+| HISTSIZE | 21 | `500 + floor(slot*9000)` |
+| TMOUT | 22 | `300 + floor(slot*3300)` |
+
+The same seed always yields the same container — the OS is a mathematical
+consequence of the lattice state, not a configuration decision.
+
+#### GPU: Warp-Parallel Schoolbook Squaring (`k_sqr_warp`)
+
+Lucas-Lehmer requires repeated squaring of a ~p-bit integer mod 2^p−1.
+`k_sqr_warp` assigns a full 32-thread warp to each output limb.  Each thread
+accumulates partial products for its limb, then `__shfl_down_sync` reduces
+the 32 partial sums to a single limb value — no global memory round-trip.
+Mersenne fold (`s mod 2^p−1 = hi + lo`) is applied inline.
+
+No cuFFT is used.  Schoolbook keeps integers exact to the bit.
+
+#### CPU: Sequential Carry (HDGL wu-wei)
+
+After each squaring kernel, the CPU performs the carry-propagation pass.
+On RTX 2060 hardware, sequential carry on CPU runs 10–12× faster than any
+GPU thread-parallel implementation — the GPU's strength is the parallel
+multiply; the CPU's strength is the sequential dependency chain.  Both do
+their natural job: **wu-wei** (acting in accordance with nature).
+
+#### Dual-Slot λₖ–σ Fused Engine (`conscious_fused_engine.cu`)
+
+A single CUDA module that fuses: fast dynamics kernel, spectral analysis,
+Markov trit gate (`−1 / 0 / +1`), and LL decision geometry.  The two slots
+(λₖ and σ) represent competing hypotheses about a candidate's primality.
+The trit gate votes after each spectral snapshot; majority over a window
+decides promote/demote/hold.
+
+#### Analog LL: 8D Kuramoto Oscillator (`ll_analog.c`)
+
+A CUDA-free, hardware-agnostic LL path.  Eight phase oscillators are seeded
+from the phi-log depth `Λ_φ = ln(p·ln2/lnφ)/lnφ − 1/(2φ)`.  Each LL
+iteration maps to: phase-double → Kuramoto sync → VCO feedback → field
+observable S(U).
+
+**Prime invariant**: for any prime p, all 8 oscillators lock to θ→0, giving
+field amplitude M(U)→8, and the resonance discriminant `S(U) ≈ 1.531`.
+Composites produce scattered S(U) ∈ [0.5, 1.7].  This provides a
+triple-confirmation signal: `osc LOCKED` + `residue = 0` + `S(U) ≈ 1.531`.
+
+#### Riemann Psi Pre-Filter
+
+Before committing GPU squaring cycles to a candidate, the psi scanner
+evaluates the Riemann explicit formula with up to 10 000 zeta zeros, assigning
+a confidence score.  Composites are eliminated cheaply before the O(n²) step.
+
+---
+
+### Performance: Gains and Losses
+
+#### Gains
+
+| What | Why it's faster |
+|------|-----------------|
+| No cuFFT | Zero floating-point rounding; integers are exact; no FFT plan overhead |
+| `k_sqr_warp` shuffle | 32 threads per limb fill all 68 SMs; `__shfl_down_sync` is register-speed (~1.2–2.5× vs naive global-scatter) |
+| CPU carry pass | O(n) sequential dependency — CPU executes 10–12× faster than any parallel GPU carry |
+| Phi-lattice pre-rank | Filters candidates by resonance score before any squaring; ~67% of known Mersenne exponents score in the high-resonance half |
+| Riemann pre-filter | Eliminates composites with 10k-zero psi scan before O(n²) squaring |
+| Lattice OS | Zero config management overhead — no Ansible/Terraform/cloud-init; the OS is derived, not configured |
+| Container persistence | `--name` + no `--rm` → `docker exec` re-attach in milliseconds; no re-boot cost |
+
+#### Losses / Trade-offs
+
+| What | Cost |
+|------|------|
+| Schoolbook O(n²) | For exponents p > ~10M, FFT-based multiplication would be faster; schoolbook is best for the sub-10M range typical of consumer GPU research |
+| `docker inspect` on every menu render | Adds ~50–100 ms of shell-spawn latency to each menu draw (acceptable for a TUI, but visible) |
+| 32 KB entropy write per `[6]` invocation | Disk write on each install; negligible in practice |
+| Single-GPU only | No MPI or multi-node path in `prime_ui.exe`; `ll_mpi.cu` exists separately for cluster use |
+| Alpine apk on first boot | Cold `apk update` + package install adds ~30–90 s to first container start (subsequent re-attaches are instant) |
+
+---
+
+### Use Cases
+
+- **Mersenne prime research on a consumer GPU** — RTX 2060 or similar; no
+  server hardware required.  The phi-lattice pre-ranks candidates so you
+  spend squaring cycles on high-resonance exponents first.
+
+- **Phi-irrational resonance study** — The Kuramoto oscillator path and
+  HDGL Dₙ(r) lattice engine are self-contained research tools for studying
+  phase synchronization and irrational-spacing field dynamics independent of
+  prime verification.
+
+- **Reproducible ephemeral OS environments** — Any team that wants a
+  container whose configuration is a mathematical object rather than a
+  config file.  Audit the lattice seed → audit the entire OS.  Rebuild from
+  the same seed on any machine and get the identical container.
+
+- **Attestable container identity** — The 64-bit seed is embedded in the
+  container's hostname, MOTD, `/etc/issue`, and all env-vars.  An external
+  verifier can re-derive every parameter from the seed and confirm container
+  integrity without inspecting the container itself.
+
+- **CUDA-free analog LL verification** — The `--squaring analog` path runs
+  on any CPU with no GPU dependency; useful for cross-checking GPU results,
+  CI on non-GPU hosts, or Kuramoto field-dynamics research.
+
+- **Spectral Markov diagnostics** — The dual-slot λₖ–σ engine and Markov
+  trit gate can be repurposed as a general-purpose anomaly detector for any
+  oscillatory time-series, not just prime verification.
+
+---
+
 ## What Is It?
 
 **conscious** is an end-to-end prime-resonance system combining:
