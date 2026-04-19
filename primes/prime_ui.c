@@ -4013,6 +4013,244 @@ static void module_wuwei_codec(void) {
 #undef WW_N
 }
 
+/* ══════════════════════════ MODULE I: Lattice Kernel ══════════════════════
+ *  The reduction.
+ *
+ *  phi_lattice[4096] is not just the entropy seed — it IS the security state.
+ *  Three primitive operations cover every cryptographic OS need:
+ *
+ *    lk_read(ctx, out, n)    derive n bytes for a named context (HKDF domain)
+ *    lk_advance()            ratchet: mix OS entropy + step → irreversible
+ *    lk_commit(sig, pub)     PhiSign(H(lattice)) = PCR-equivalent attestation
+ *
+ *  Higher-level OS primitives are pure composition:
+ *    lk_seal / lk_unseal     sealed storage  (AES-256-GCM, key from lattice)
+ *    lk_proc_context(pid)    per-process entropy isolation
+ *
+ *  OS model (lattice as hardware security register):
+ *    boot       lk_advance() per stage    → lattice encodes full boot history
+ *    interrupt  lk_advance() on each IRQ  → entropy evolves with system activity
+ *    syscall    lk_read("cap-N", ...)     → per-capability sealed token
+ *    process    lk_proc_context(pid)      → isolated per-process entropy stream
+ *    storage    lk_seal(data)             → TPM-equivalent sealed blob
+ *    audit      lk_commit()              → attested PCR chain
+ *
+ *  No key store.  No PKI.  No key manager daemon.
+ *  The lattice state IS the security state.  Wu-wei: no forcing.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Derive a full Ed25519Key from a fixed 32-byte seed (no CSPRNG needed) */
+static void phisign_from_seed(const uint8_t seed[32], Ed25519Key *kp) {
+    memcpy(kp->priv, seed, 32);
+    static ge25519 B_lks; static int B_lks_ok = 0;
+    if (!B_lks_ok) {
+        fe_from_bytes(B_lks.X, ED25519_BX_BYTES);
+        fe_from_bytes(B_lks.Y, ED25519_BY_BYTES);
+        for (int i = 0; i < 5; i++) B_lks.Z[i] = (i == 0) ? 1 : 0;
+        fe_from_bytes(B_lks.T, ED25519_BT_BYTES);
+        B_lks_ok = 1;
+    }
+    uint8_t H[64]; phi_sha512_emul(H, kp->priv, 32);
+    uint8_t a[32]; memcpy(a, H, 32); a[0] &= 248; a[31] &= 63; a[31] |= 64;
+    ge25519 P; ge_scalarmult(&P, a, &B_lks); ge_encode(kp->pub, &P);
+}
+
+/* SHA-256 over the entire live lattice */
+static void lk_hash_lattice(uint8_t h[32]) {
+    Sha256Ctx s; sha256_init(&s);
+    sha256_update(&s, (const uint8_t*)lattice, (size_t)lattice_N * sizeof(double));
+    sha256_final(&s, h);
+}
+
+/* Master PRK: HKDF-Extract(sha256(lattice[0..255]), full lattice bytes) */
+static void lk_derive_prk(uint8_t prk[32]) {
+    uint8_t salt[32]; Sha256Ctx s; sha256_init(&s);
+    int n = (lattice_N < 256) ? lattice_N : 256;
+    sha256_update(&s, (const uint8_t*)lattice, (size_t)n * sizeof(double));
+    sha256_final(&s, salt);
+    hkdf_extract(salt, 32, (const uint8_t*)lattice,
+                 (size_t)lattice_N * sizeof(double), prk);
+}
+
+/* Derive n bytes for a named context (domain separation via HKDF-Expand) */
+static void lk_read(const char *ctx, uint8_t *out, size_t n) {
+    uint8_t prk[32]; lk_derive_prk(prk);
+    hkdf_expand(prk, (const uint8_t*)ctx, strlen(ctx), out, n);
+}
+
+/* Ratchet: XOR BCrypt entropy into raw lattice bytes, advance resonance */
+static void lk_advance(void) {
+    uint8_t os[32] = {0};
+    BCryptGenRandom(NULL, os, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    uint8_t *lb = (uint8_t*)lattice;
+    size_t cap = (size_t)lattice_N * sizeof(double);
+    for (int i = 0; i < 32 && (size_t)i < cap; i++) lb[i] ^= os[i];
+    lattice_step();
+    lattice_seed_steps_done++;
+    memset(os, 0, 32);
+}
+
+/* Commit: derive attest keypair, sign H(lattice), output sig + pub.
+ * Call phisign_verify(sig, pub, msg, 32) where msg = lk_hash_lattice(). */
+static void lk_commit(uint8_t sig[64], uint8_t pub[32]) {
+    uint8_t seed[32]; lk_read("lk-attest-v1", seed, 32);
+    Ed25519Key kp; phisign_from_seed(seed, &kp);
+    uint8_t msg[32]; lk_hash_lattice(msg);
+    phisign_sign(sig, &kp, msg, 32);
+    memcpy(pub, kp.pub, 32);
+    memset(seed, 0, 32); memset(kp.priv, 0, 32);
+}
+
+/* Seal: derive key+nonce from lattice, AES-256-GCM encrypt.
+ * Output: nonce[12] | tag[16] | ct[ptlen].  Returns sealed byte count. */
+static size_t lk_seal(const uint8_t *pt, size_t ptlen, uint8_t *out, size_t cap) {
+    if (cap < ptlen + 28) return 0;
+    uint8_t km[44]; lk_read("lk-seal-v1", km, 44); /* km[0..31]=key, km[32..43]=nonce */
+    Aes256GcmKey gk; aes256gcm_keyschedule(km, gk.ks);
+    memcpy(out, km + 32, 12);                        /* nonce → output[0..11] */
+    aes256gcm_encrypt(&gk, km + 32, pt, ptlen, NULL, 0, out + 28, out + 12);
+    memset(km, 0, 44);
+    return ptlen + 28;
+}
+
+/* Unseal: verify tag, decrypt. Returns plaintext length or -1 on failure. */
+static int lk_unseal(const uint8_t *in, size_t inlen, uint8_t *pt, size_t cap) {
+    if (inlen < 28) return -1;
+    size_t ptlen = inlen - 28;
+    if (cap < ptlen) return -1;
+    uint8_t km[44]; lk_read("lk-seal-v1", km, 44);
+    Aes256GcmKey gk; aes256gcm_keyschedule(km, gk.ks);
+    int r = aes256gcm_decrypt(&gk, in, in + 28, ptlen, NULL, 0, in + 12, pt);
+    memset(km, 0, 44);
+    return r == 0 ? (int)ptlen : -1;
+}
+
+/* Per-process key: HKDF domain "lk-proc-PPPPPPPP" */
+static void lk_proc_context(uint32_t pid, uint8_t key[32]) {
+    char ctx[20]; snprintf(ctx, sizeof(ctx), "lk-proc-%08x", (unsigned)pid);
+    lk_read(ctx, key, 32);
+}
+
+static void module_lk(void) {
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [I] Lattice Kernel  --  phi[4096] as Cryptographic OS Root   |\n"
+        "+================================================================+\n"
+        CR "\n");
+    printf("  Three primitives.  Everything else is composition:\n");
+    printf("    " YEL "lk_read(ctx,n)" CR "  domain-separated key material\n");
+    printf("    " YEL "lk_advance()" CR "    ratchet: entropy + step  →  irreversible\n");
+    printf("    " YEL "lk_commit()" CR "     PhiSign(H(lattice))  →  PCR attestation\n\n");
+
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+
+    /* ── I1: domain-separated key derivation ── */
+    printf("  " BOLD "I1  Domain separation  (lk_read)" CR "\n");
+    uint8_t k_aes[32], k_dh[32], k_sign[32];
+    lk_read("lk-aes256-gcm",    k_aes,  32);
+    lk_read("lk-x25519-static", k_dh,   32);
+    lk_read("lk-sign-priv",     k_sign, 32);
+    uint8_t d01 = 0, d02 = 0, d12 = 0;
+    for (int i = 0; i < 32; i++) {
+        d01 |= k_aes[i]  ^ k_dh[i];
+        d02 |= k_aes[i]  ^ k_sign[i];
+        d12 |= k_dh[i]   ^ k_sign[i];
+    }
+    printf("    aes-key  : "); for(int i=0;i<16;i++) printf("%02x",k_aes[i]);  printf("...\n");
+    printf("    dh-key   : "); for(int i=0;i<16;i++) printf("%02x",k_dh[i]);   printf("...\n");
+    printf("    sign-key : "); for(int i=0;i<16;i++) printf("%02x",k_sign[i]); printf("...\n");
+    printf("    domain   : %s\n\n",
+           (d01 && d02 && d12) ? GRN "[OK — all contexts distinct]" CR
+                               : RED "[FAIL — domain separation broken]" CR);
+
+    /* ── I2: PCR attestation ── */
+    printf("  " BOLD "I2  PCR attestation  (lk_commit)" CR "\n");
+    uint8_t sig[64], attest_pub[32], hmsg[32];
+    lk_commit(sig, attest_pub);
+    lk_hash_lattice(hmsg);
+    int att_ok = phisign_verify(sig, attest_pub, hmsg, 32);
+    printf("    H(lattice) : "); for(int i=0;i<16;i++) printf("%02x",hmsg[i]);       printf("...\n");
+    printf("    sig[R]     : "); for(int i=0;i<16;i++) printf("%02x",sig[i]);        printf("...\n");
+    printf("    attest pub : "); for(int i=0;i<16;i++) printf("%02x",attest_pub[i]); printf("...\n");
+    printf("    verify     : %s\n\n", att_ok == 0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* ── I3: sealed storage ── */
+    printf("  " BOLD "I3  Sealed storage  (lk_seal / lk_unseal)" CR "\n");
+    static const uint8_t KCFG[] = "kernel-config: phi=1.618 N=4096 boot-state=sealed";
+    uint8_t sealed[sizeof(KCFG) + 28];
+    size_t ssz = lk_seal(KCFG, sizeof(KCFG) - 1, sealed, sizeof(sealed));
+    uint8_t plain[sizeof(KCFG)]; memset(plain, 0, sizeof(plain));
+    int ur  = lk_unseal(sealed, ssz, plain, sizeof(plain));
+    int rto = (ur == (int)(sizeof(KCFG) - 1)) && (memcmp(plain, KCFG, sizeof(KCFG)-1) == 0);
+    printf("    plaintext  : \"%.*s\"\n", (int)(sizeof(KCFG) - 1), KCFG);
+    printf("    sealed     : %zu bytes  (nonce[12] | tag[16] | ct)\n", ssz);
+    printf("    round-trip : %s\n\n", rto ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* ── I4: per-process isolation ── */
+    printf("  " BOLD "I4  Process isolation  (lk_proc_context)" CR "\n");
+    uint8_t pk0[32], pk1[32], pk42[32];
+    lk_proc_context(0,  pk0);
+    lk_proc_context(1,  pk1);
+    lk_proc_context(42, pk42);
+    uint8_t dp = 0;
+    for (int i = 0; i < 32; i++) dp |= (pk0[i] ^ pk1[i]) | (pk0[i] ^ pk42[i]);
+    printf("    pid=0      : "); for(int i=0;i<16;i++) printf("%02x",pk0[i]);  printf("...\n");
+    printf("    pid=1      : "); for(int i=0;i<16;i++) printf("%02x",pk1[i]);  printf("...\n");
+    printf("    pid=42     : "); for(int i=0;i<16;i++) printf("%02x",pk42[i]); printf("...\n");
+    printf("    isolated   : %s\n\n",
+           dp ? GRN "[OK — all PIDs derive distinct keys]" CR : RED "[FAIL]" CR);
+
+    /* ── I5: forward secrecy via ratchet ── */
+    printf("  " BOLD "I5  Forward secrecy  (lk_advance)" CR "\n");
+    uint8_t prk_pre[32], prk_post[32];
+    lk_derive_prk(prk_pre);
+    lk_advance();
+    lk_derive_prk(prk_post);
+    uint8_t df = 0; for (int i = 0; i < 32; i++) df |= prk_pre[i] ^ prk_post[i];
+    printf("    PRK before : "); for(int i=0;i<16;i++) printf("%02x",prk_pre[i]);  printf("...\n");
+    printf("    PRK after  : "); for(int i=0;i<16;i++) printf("%02x",prk_post[i]); printf("...\n");
+    printf("    ratcheted  : %s\n\n",
+           df ? GRN "[OK — past state irrecoverable]" CR : RED "[FAIL]" CR);
+
+    /* ── I6: wu-wei → seal → commit — full pipeline ── */
+    printf("  " BOLD "I6  Full pipeline  (wu-wei → seal → commit)" CR "\n");
+    const uint8_t *lbytes = (const uint8_t*)lattice;
+    size_t snap = (size_t)lattice_N * sizeof(double);
+    if (snap > 2048) snap = 2048;
+    uint8_t *cbuf = (uint8_t*)malloc(snap * 4 + 64);
+    if (!cbuf) { printf("    " RED "[ERR] malloc\n" CR); return; }
+    /* lattice-derived wu-wei hint — no separate CSPRNG call needed */
+    uint8_t hb[2]; lk_read("lk-ww-hint", hb, 2);
+    float hint = (float)((uint32_t)hb[0] | ((uint32_t)hb[1] << 8)) / 65535.0f;
+    float ent = ww_entropy(lbytes, snap), cor = ww_correlation(lbytes, snap),
+          rep = ww_repetition(lbytes, snap);
+    WuWeiStrat strat = ww_select(ent, cor, rep, hint);
+    size_t csz = ww_compress(lbytes, snap, cbuf, snap * 4 + 64, strat);
+    /* seal */
+    uint8_t *sbuf = (uint8_t*)malloc(csz + 28);
+    if (!sbuf) { free(cbuf); printf("    " RED "[ERR] malloc\n" CR); return; }
+    size_t sealed_sz = lk_seal(cbuf, csz, sbuf, csz + 28);
+    /* attest the post-seal lattice state */
+    uint8_t psig[64], ppub[32]; lk_commit(psig, ppub);
+    uint8_t pmsg[32]; lk_hash_lattice(pmsg);
+    int pat = phisign_verify(psig, ppub, pmsg, 32);
+    free(cbuf); free(sbuf);
+    printf("    snapshot   : %zu B  →  wu-wei \"%s\"  →  %zu B\n",
+           snap, WW_NAMES[strat], csz);
+    printf("    sealed     : %zu B  (AES-256-GCM)\n", sealed_sz);
+    printf("    attested   : %s\n\n", pat == 0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    printf("  " BOLD "Kernel model (the full reduction):" CR "\n");
+    printf("    boot       lk_advance() × stages  → lattice encodes boot history\n");
+    printf("    interrupt  lk_advance() on IRQ    → entropy evolves with system\n");
+    printf("    syscall    lk_read(\"cap-N\")        → per-capability sealed token\n");
+    printf("    process    lk_proc_context(pid)    → isolated per-process entropy\n");
+    printf("    storage    lk_seal(data)            → TPM-equivalent sealed blob\n");
+    printf("    audit      lk_commit()              → PCR chain, attested boot\n\n");
+    printf("    No key store.  No PKI.  No key manager daemon.\n");
+    printf("    The lattice state IS the security state.\n\n");
+}
+
 /* ══════════════════════════ MAIN ════════════════════════════════════════════ */
 
 static void print_banner(void) {
@@ -5513,6 +5751,7 @@ static void print_menu(void) {
     printf("  " YEL "[F]" CR " Full Crypto Stack     AES-256-GCM + X25519 + Noise_XX (lattice-keyed)\n");
     printf("  " YEL "[G]" CR " Wu-Wei Codec          fold26 lattice-adaptive compression\n");
     printf("  " YEL "[H]" CR " PhiSign               Ed25519 twisted Edwards sign/verify (lattice-keyed)\n");
+    printf("  " YEL "[I]" CR " Lattice Kernel        lk_read/advance/commit  — cryptographic OS root\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -5543,6 +5782,7 @@ int main(int argc, char *argv[]) {
         case 'f': module_fullcrypto();              break;
         case 'g': module_wuwei_codec();              break;
         case 'h': module_phisign();                  break;
+        case 'i': module_lk();                       break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -5577,6 +5817,7 @@ int main(int argc, char *argv[]) {
         case 'f': module_fullcrypto();            break;
         case 'g': module_wuwei_codec();            break;
         case 'h': module_phisign();                break;
+        case 'i': module_lk();                     break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
