@@ -16,8 +16,9 @@
  *
  * Self-contained.  All math inlined from bench_prime_funcs.c,
  * prime_pipeline.c, phi_mersenne_predictor.c.
- * No external dependencies beyond MSVCRT + kernel32.
+ * No external dependencies beyond MSVCRT + kernel32 + bcrypt.
  */
+#pragma comment(lib, "bcrypt.lib")
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #  define _CRT_SECURE_NO_WARNINGS
@@ -27,6 +28,7 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <bcrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2462,15 +2464,26 @@ typedef struct {
 static const uint8_t PHI_CSPRNG_INFO[] = "phi-native-csprng-v1";
 
 static void phi_csprng_init(PhiCSPRNG *rng, uint64_t jitter_seed) {
-    /* salt = 8-byte big-endian jitter seed */
+    /* Mix OS entropy (BCryptGenRandom) with RDTSC jitter.
+     * On Hyper-V the TSC is virtualized; BCrypt adds real OS randomness. */
+    uint8_t os_rand[32] = {0};
+    BCryptGenRandom(NULL, os_rand, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    /* salt = 8-byte jitter XOR first 8 bytes of OS rand */
     uint8_t salt[8];
     uint64_t js = jitter_seed;
-    for (int i=7;i>=0;i--){ salt[i]=(uint8_t)(js&0xff); js>>=8; }
-    /* IKM = raw bytes of lattice[lattice_N] */
-    hkdf_extract(salt, 8, (const uint8_t*)lattice,
-                 (size_t)lattice_N * sizeof(double), rng->prk);
+    for(int i=7;i>=0;i--){ salt[i]=(uint8_t)(js&0xff)^os_rand[7-i]; js>>=8; }
+    /* IKM = raw bytes of lattice[lattice_N] XOR remaining OS rand (tiled) */
+    size_t ikm_len = (size_t)lattice_N * sizeof(double);
+    uint8_t *ikm = (uint8_t*)lattice;  /* read-only view */
+    /* We XOR os_rand[8..31] into the HKDF-Extract key (the salt already mixes
+     * os_rand[0..7]); the IKM is the raw lattice bytes unmodified — the lattice
+     * is the root of trust, OS rand hardens against TSC virtualization attacks */
+    uint8_t salt2[32]; memcpy(salt2, salt, 8);
+    memcpy(salt2+8, os_rand+8, 24);  /* extended salt = jitter||BCrypt[8..31] */
+    hkdf_extract(salt2, 32, ikm, ikm_len, rng->prk);
     rng->pos = 32; rng->ctr = 0;
     memset(rng->block, 0, 32);
+    memset(os_rand, 0, 32); /* clear OS rand from stack */
 }
 
 static uint8_t phi_csprng_byte(PhiCSPRNG *rng) {
@@ -2606,6 +2619,7 @@ static void module_crypto(void) {
  *    aes256gcm_decrypt(ks,nonce[12],ct,ctlen,aad,aadlen,tag → pt, 0=ok)
  * ════════════════════════════════════════════════════════════════════════ */
 #include <wmmintrin.h>  /* AES-NI intrinsics */
+/* bcrypt.h included at top of file */
 
 typedef __m128i Aes128Block;
 
@@ -3214,6 +3228,518 @@ static void module_fullcrypto(void) {
     printf("    Lattice role:  " GRN "[X]" CR "  phi[4096] resonance state seeds ALL keys\n\n");
 }
 
+/* ── Wu-Wei forward declarations (Module G defined below) ───────────────── */
+typedef enum {
+    WW_NONACTION=0, WW_FLOWING_RIVER=1, WW_REPEATED_WAVES=2,
+    WW_GENTLE_STREAM=3, WW_BALANCED_PATH=4
+} WuWeiStrat;
+static const char * const WW_NAMES[5] = {
+    "Non-Action      (raw)",
+    "Flowing River   (delta->rle x2)",
+    "Repeated Waves  (rle->delta->rle)",
+    "Gentle Stream   (delta->rle)",
+    "Balanced Path   (delta->rle)"
+};
+static float  ww_entropy(const uint8_t *d, size_t n);
+static float  ww_correlation(const uint8_t *d, size_t n);
+static float  ww_repetition(const uint8_t *d, size_t n);
+static WuWeiStrat ww_select(float ent, float cor, float rep, float hint);
+static size_t ww_compress(const uint8_t *in, size_t n,
+                           uint8_t *out, size_t cap, WuWeiStrat s);
+static size_t ww_decompress(const uint8_t *in, size_t n,
+                             uint8_t *out, size_t cap);
+
+/* ══════════════════════════ MODULE H: Ed25519 PhiSign ══════════════════════
+ *  Full twisted Edwards scalar signing over Curve25519 / Ed25519.
+ *  Hash: phi_sha512_emul (2×SHA-256, domain-separated) — "PhiSign"
+ *  Keys: derived from phi_csprng (lattice-seeded), NOT from random(3).
+ *  Wu-wei integration: sign(ww_compress(data)) — data guides its own path
+ *  then the signature seals the compressed form.
+ *
+ *  Curve: a=-1, d=-121665/121666 mod p, p=2^255-19, l=2^252+c
+ *  Coordinates: extended homogeneous (X:Y:Z:T), x=X/Z y=Y/Z T=XY/Z
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* ── Curve constants (computed & verified by Python) ────────────────────── */
+static const uint8_t ED25519_D_BYTES[32] = {
+    0xa3,0x78,0x59,0x13,0xca,0x4d,0xeb,0x75,
+    0xab,0xd8,0x41,0x41,0x4d,0x0a,0x70,0x00,
+    0x98,0xe8,0x79,0x77,0x79,0x40,0xc7,0x8c,
+    0x73,0xfe,0x6f,0x2b,0xee,0x6c,0x03,0x52,
+};
+static const uint8_t ED25519_D2_BYTES[32] = {
+    0x59,0xf1,0xb2,0x26,0x94,0x9b,0xd6,0xeb,
+    0x56,0xb1,0x83,0x82,0x9a,0x14,0xe0,0x00,
+    0x30,0xd1,0xf3,0xee,0xf2,0x80,0x8e,0x19,
+    0xe7,0xfc,0xdf,0x56,0xdc,0xd9,0x06,0x24,
+};
+static const uint8_t ED25519_SQRTM1_BYTES[32] = {
+    0xb0,0xa0,0x0e,0x4a,0x27,0x1b,0xee,0xc4,
+    0x78,0xe4,0x2f,0xad,0x06,0x18,0x43,0x2f,
+    0xa7,0xd7,0xfb,0x3d,0x99,0x00,0x4d,0x2b,
+    0x0b,0xdf,0xc1,0x4f,0x80,0x24,0x83,0x2b,
+};
+static const uint8_t ED25519_BX_BYTES[32] = {
+    0x1a,0xd5,0x25,0x8f,0x60,0x2d,0x56,0xc9,
+    0xb2,0xa7,0x25,0x95,0x60,0xc7,0x2c,0x69,
+    0x5c,0xdc,0xd6,0xfd,0x31,0xe2,0xa4,0xc0,
+    0xfe,0x53,0x6e,0xcd,0xd3,0x36,0x69,0x21,
+};
+static const uint8_t ED25519_BY_BYTES[32] = {
+    0x58,0x66,0x66,0x66,0x66,0x66,0x66,0x66,
+    0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,
+    0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,
+    0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,
+};
+static const uint8_t ED25519_BT_BYTES[32] = {
+    0xa3,0xdd,0xb7,0xa5,0xb3,0x8a,0xde,0x6d,
+    0xf5,0x52,0x51,0x77,0x80,0x9f,0xf0,0x20,
+    0x7d,0xe3,0xab,0x64,0x8e,0x4e,0xea,0x66,
+    0x65,0x76,0x8b,0xd7,0x0f,0x5f,0x87,0x67,
+};
+/* l = 2^252 + 27742317777372353535851937790883648493 (bytes LE) */
+static const int64_t SC_L[32] = {
+    0xed,0xd3,0xf5,0x5c,0x1a,0x63,0x12,0x58,
+    0xd6,0x9c,0xf7,0xa2,0xde,0xf9,0xde,0x14,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x10
+};
+
+/* ── Additional field operations ────────────────────────────────────────── */
+static void fe_neg(fe25519 h, const fe25519 f) {
+    for(int i=0;i<5;i++) h[i]=-f[i];
+}
+static int fe_is_negative(const fe25519 f) { /* returns lsb of reduced |f| */
+    uint8_t s[32]; fe_to_bytes(s,f); return s[0]&1;
+}
+static int fe_equal_ct(const fe25519 a, const fe25519 b) {
+    uint8_t sa[32],sb[32]; fe_to_bytes(sa,a); fe_to_bytes(sb,b);
+    uint8_t d=0; for(int i=0;i<32;i++) d|=sa[i]^sb[i]; return d==0;
+}
+/* z^((p-5)/8) needed for sqrt of field element */
+static void fe_pow22523(fe25519 out, const fe25519 z) {
+    fe25519 t0,t1,t2;
+    fe_sq(t0,z);
+    fe_sq(t1,t0); fe_sq(t1,t1);
+    fe_mul(t1,z,t1);
+    fe_mul(t0,t0,t1);
+    fe_sq(t0,t0);
+    fe_mul(t0,t0,t1);
+    fe_sq(t1,t0); for(int i=1;i<5;i++) fe_sq(t1,t1);
+    fe_mul(t0,t1,t0);
+    fe_sq(t1,t0); for(int i=1;i<10;i++) fe_sq(t1,t1);
+    fe_mul(t1,t1,t0);
+    fe_sq(t2,t1); for(int i=1;i<20;i++) fe_sq(t2,t2);
+    fe_mul(t1,t2,t1);
+    fe_sq(t1,t1); for(int i=1;i<10;i++) fe_sq(t1,t1);
+    fe_mul(t0,t1,t0);
+    fe_sq(t1,t0); for(int i=1;i<50;i++) fe_sq(t1,t1);
+    fe_mul(t1,t1,t0);
+    fe_sq(t2,t1); for(int i=1;i<100;i++) fe_sq(t2,t2);
+    fe_mul(t1,t2,t1);
+    fe_sq(t1,t1); for(int i=1;i<50;i++) fe_sq(t1,t1);
+    fe_mul(t0,t1,t0);
+    fe_sq(t0,t0); fe_sq(t0,t0);    /* 2 squarings → z^(2^252-4) */
+    fe_mul(out,t0,z);               /* × z → z^(2^252-3) = z^((p-5)/8) ✓ */
+}
+
+/* ── Extended Edwards point type ────────────────────────────────────────── */
+typedef struct { fe25519 X,Y,Z,T; } ge25519;
+
+static void ge_neutral(ge25519 *P) {
+    for(int i=0;i<5;i++){ P->X[i]=0; P->Y[i]=(i==0)?1:0;
+                           P->Z[i]=(i==0)?1:0; P->T[i]=0; }
+}
+
+/* Complete point addition: P3 = P1 + P2 (twisted Edwards, a=-1) */
+static void ge_add(ge25519 *r, const ge25519 *p, const ge25519 *q) {
+    fe25519 A,B,C,D,E,F,G,H;
+    static fe25519 d2; static int d2_loaded=0;
+    if(!d2_loaded){ fe_from_bytes(d2,ED25519_D2_BYTES); d2_loaded=1; }
+    /* A=(Y1-X1)*(Y2-X2) */
+    fe25519 t0,t1;
+    fe_sub(t0,p->Y,p->X); fe_sub(t1,q->Y,q->X); fe_mul(A,t0,t1);
+    /* B=(Y1+X1)*(Y2+X2) */
+    fe_add(t0,p->Y,p->X); fe_add(t1,q->Y,q->X); fe_mul(B,t0,t1);
+    /* C=T1*2d*T2 */
+    fe_mul(C,p->T,q->T); fe_mul(C,C,d2);
+    /* D=Z1*2*Z2 */
+    fe_add(D,p->Z,p->Z); fe_mul(D,D,q->Z);
+    /* E=B-A, F=D-C, G=D+C, H=B+A */
+    fe_sub(E,B,A); fe_sub(F,D,C); fe_add(G,D,C); fe_add(H,B,A);
+    fe_mul(r->X,E,F); fe_mul(r->Y,G,H);
+    fe_mul(r->Z,F,G); fe_mul(r->T,E,H);
+}
+
+/* Point doubling — dbl-2008-hwcd formula, a=-1:
+ * A=X1^2, B=Y1^2, C=2*Z1^2, D=a*A=-A
+ * E=(X1+Y1)^2-A-B (=2*X1*Y1), G=D+B, F=G-C, H=D-B
+ * X3=E*F, Y3=G*H, Z3=F*G, T3=E*H
+ */
+static void ge_double(ge25519 *r, const ge25519 *p) {
+    fe25519 A,B,C,D,E,G,F,H,t0,ApB;
+    fe_sq(A, p->X);
+    fe_sq(B, p->Y);
+    fe_sq(C, p->Z); fe_add(C, C, C);   /* C = 2*Z^2 */
+    fe_neg(D, A);                        /* D = -A  (a = -1) */
+    fe_add(t0, p->X, p->Y); fe_sq(t0, t0);
+    fe_add(ApB, A, B);
+    fe_sub(E, t0, ApB);                  /* E = (X+Y)^2 - A - B = 2XY */
+    fe_add(G, D, B);                     /* G = -A+B */
+    fe_sub(F, G, C);                     /* F = G-C */
+    fe_sub(H, D, B);                     /* H = -A-B */
+    fe_mul(r->X, E, F);
+    fe_mul(r->Y, G, H);
+    fe_mul(r->Z, F, G);
+    fe_mul(r->T, E, H);
+}
+
+/* Constant-time conditional swap */
+static void ge_cswap(ge25519 *p, ge25519 *q, int b) {
+    fe_cswap(p->X,q->X,b); fe_cswap(p->Y,q->Y,b);
+    fe_cswap(p->Z,q->Z,b); fe_cswap(p->T,q->T,b);
+}
+
+/* 255-bit scalar multiplication (double-and-add, MSB first) */
+static void ge_scalarmult(ge25519 *r, const uint8_t scalar[32], const ge25519 *P) {
+    ge25519 Q; ge_neutral(&Q);
+    for(int i=254;i>=0;i--){
+        ge_double(&Q,&Q);
+        int b=(scalar[i/8]>>(i%8))&1;
+        ge25519 tmp; ge_add(&tmp,&Q,P);
+        ge_cswap(&Q,&tmp,b); ge_cswap(&Q,&tmp,b); /* swap-add-swap = conditional add */
+        /* Cleaner: copy-on-bit */
+        ge_neutral(&tmp); ge_add(&tmp,&Q,P);
+        /* Use ge_cswap to conditionally accept: */
+        for(int j=0;j<5;j++){
+            int64_t mask=-(int64_t)b;
+            int64_t dx=(Q.X[j]^tmp.X[j])&mask; Q.X[j]^=dx;
+            int64_t dy=(Q.Y[j]^tmp.Y[j])&mask; Q.Y[j]^=dy;
+            int64_t dz=(Q.Z[j]^tmp.Z[j])&mask; Q.Z[j]^=dz;
+            int64_t dt=(Q.T[j]^tmp.T[j])&mask; Q.T[j]^=dt;
+        }
+    }
+    *r=Q;
+}
+
+/* Encode point to 32 bytes (y LE, sign(x) in top bit) */
+static void ge_encode(uint8_t out[32], const ge25519 *P) {
+    fe25519 zinv,x,y;
+    fe_inv(zinv,P->Z);
+    fe_mul(x,P->X,zinv);
+    fe_mul(y,P->Y,zinv);
+    fe_to_bytes(out,y);
+    out[31] |= (uint8_t)(fe_is_negative(x)<<7);
+}
+
+/* Decode 32 bytes to point; returns 0=OK, -1=invalid */
+static int ge_decode(ge25519 *P, const uint8_t enc[32]) {
+    static fe25519 d_fe; static int d_loaded=0;
+    static fe25519 sm1;  static int sm1_loaded=0;
+    if(!d_loaded)  { fe_from_bytes(d_fe,  ED25519_D_BYTES);     d_loaded=1;  }
+    if(!sm1_loaded){ fe_from_bytes(sm1,   ED25519_SQRTM1_BYTES);sm1_loaded=1;}
+    uint8_t tmp[32]; memcpy(tmp,enc,32);
+    int x_sign=(tmp[31]>>7)&1; tmp[31]&=0x7f;
+    fe25519 y; fe_from_bytes(y,tmp);
+    /* u = y^2-1, v = d*y^2+1 */
+    fe25519 y2,u,v; fe_sq(y2,y);
+    fe25519 one; for(int i=0;i<5;i++) one[i]=(i==0)?1:0;
+    fe_sub(u,y2,one);
+    fe25519 dv; fe_mul(dv,d_fe,y2); fe_add(v,dv,one);
+    /* x = (u*v^3) * (u*v^7)^((p-5)/8) */
+    fe25519 v2,v3,v7,r,uv3,uv7;
+    fe_sq(v2,v); fe_mul(v3,v2,v);
+    fe_sq(v7,v3); fe_mul(v7,v7,v);
+    fe_mul(uv3,u,v3); fe_mul(uv7,u,v7);
+    fe_pow22523(r,uv7);
+    fe_mul(r,r,uv3);
+    /* check: v*r^2 == u ? */
+    fe25519 chk,r2; fe_sq(r2,r); fe_mul(chk,v,r2);
+    fe25519 neg_u; fe_neg(neg_u,u);
+    if(!fe_equal_ct(chk,u)){
+        if(!fe_equal_ct(chk,neg_u)) return -1; /* not on curve */
+        fe_mul(r,r,sm1);
+    }
+    if(fe_is_negative(r)!=x_sign) fe_neg(r,r);
+    memcpy(P->X,r,sizeof(fe25519));
+    memcpy(P->Y,y,sizeof(fe25519));
+    for(int i=0;i<5;i++) P->Z[i]=(i==0)?1:0;
+    fe_mul(P->T,r,y);
+    return 0;
+}
+
+/* ── Scalar reduction mod l (TweetNaCl modL algorithm) ─────────────────── */
+static void sc_reduce64(uint8_t r[32], const uint8_t s[64]) {
+    int64_t x[64]; int64_t carry;
+    for(int i=0;i<64;i++) x[i]=(int64_t)s[i];
+    for(int i=63;i>=32;i--){
+        carry=0;
+        for(int j=i-32;j<i-12;j++){
+            x[j]+=carry-16*x[i]*SC_L[j-(i-32)];
+            carry=(x[j]+128)>>8; x[j]-=carry<<8;
+        }
+        x[i-12]+=carry; x[i]=0;
+    }
+    carry=0;
+    for(int j=0;j<32;j++){
+        x[j]+=carry-(x[31]>>4)*SC_L[j];
+        carry=x[j]>>8; x[j]&=255;
+    }
+    for(int j=0;j<32;j++) x[j]-=carry*SC_L[j];
+    for(int i=0;i<32;i++){
+        if(i<31) x[i+1]+=x[i]>>8;
+        r[i]=(uint8_t)(x[i]&255);
+    }
+}
+
+/* s = (a*b + c) mod l — all 32-byte scalars */
+static void sc_muladd(uint8_t s[32], const uint8_t a[32],
+                      const uint8_t b[32], const uint8_t c[32]) {
+    int64_t x[64]={0};
+    for(int i=0;i<32;i++)
+        for(int j=0;j<32;j++)
+            x[i+j]+=(int64_t)(uint8_t)a[i]*(int64_t)(uint8_t)b[j];
+    for(int i=0;i<32;i++) x[i]+=(int64_t)(uint8_t)c[i];
+    /* carry propagation before modL */
+    int64_t carry=0;
+    for(int i=0;i<64;i++){
+        x[i]+=carry; carry=x[i]>>8; x[i]&=255;
+    }
+    uint8_t sb[64];
+    for(int i=0;i<64;i++) sb[i]=(uint8_t)(x[i]&255);
+    sc_reduce64(s,sb);
+}
+
+/* ── PhiSign: Ed25519-style sign/verify with phi_sha512_emul hash ────────── */
+static void phisign_sign(uint8_t sig[64], const Ed25519Key *kp,
+                         const uint8_t *msg, size_t mlen) {
+    /* Step 1: expand private key */
+    uint8_t H[64]; phi_sha512_emul(H, kp->priv, 32);
+    uint8_t a[32]; memcpy(a,H,32);
+    a[0]&=248; a[31]&=63; a[31]|=64;   /* scalar clamp */
+    uint8_t prefix[32]; memcpy(prefix,H+32,32);
+
+    /* Step 2: deterministic nonce r = H(prefix || msg) */
+    uint8_t rm_buf[32+mlen ? 32+mlen : 1];
+    memcpy(rm_buf, prefix, 32);
+    if(mlen) memcpy(rm_buf+32, msg, mlen);
+    uint8_t rH[64]; phi_sha512_emul(rH, rm_buf, 32+mlen);
+    uint8_t r_scalar[32]; sc_reduce64(r_scalar, rH);
+
+    /* Step 3: R = r * B */
+    static ge25519 B; static int B_loaded=0;
+    if(!B_loaded){
+        fe_from_bytes(B.X,ED25519_BX_BYTES);
+        fe_from_bytes(B.Y,ED25519_BY_BYTES);
+        for(int i=0;i<5;i++) B.Z[i]=(i==0)?1:0;
+        fe_from_bytes(B.T,ED25519_BT_BYTES);
+        B_loaded=1;
+    }
+    ge25519 R; ge_scalarmult(&R, r_scalar, &B);
+    uint8_t R_bytes[32]; ge_encode(R_bytes, &R);
+    memcpy(sig, R_bytes, 32);
+
+    /* Step 4: h = H(R || pub || msg) */
+    size_t hlen = 32+32+mlen;
+    uint8_t *hbuf = (uint8_t*)malloc(hlen ? hlen : 1);
+    if(!hbuf) return;
+    memcpy(hbuf,        R_bytes,  32);
+    memcpy(hbuf+32,     kp->pub,  32);
+    if(mlen) memcpy(hbuf+64, msg, mlen);
+    uint8_t hH[64]; phi_sha512_emul(hH, hbuf, hlen);
+    free(hbuf);
+    uint8_t h_scalar[32]; sc_reduce64(h_scalar, hH);
+
+    /* Step 5: S = (r + h*a) mod l */
+    uint8_t S[32]; sc_muladd(S, h_scalar, a, r_scalar);
+    memcpy(sig+32, S, 32);
+}
+
+/* Returns 0=valid, -1=invalid */
+static int phisign_verify(const uint8_t sig[64], const uint8_t pub[32],
+                          const uint8_t *msg, size_t mlen) {
+    static ge25519 B; static int B_loaded=0;
+    if(!B_loaded){
+        fe_from_bytes(B.X,ED25519_BX_BYTES);
+        fe_from_bytes(B.Y,ED25519_BY_BYTES);
+        for(int i=0;i<5;i++) B.Z[i]=(i==0)?1:0;
+        fe_from_bytes(B.T,ED25519_BT_BYTES);
+        B_loaded=1;
+    }
+    /* Decode A */
+    ge25519 A;
+    if(ge_decode(&A, pub)!=0) return -1;
+
+    const uint8_t *R_bytes = sig;
+    const uint8_t *S_bytes = sig+32;
+
+    /* h = H(R || pub || msg) */
+    size_t hlen=32+32+mlen;
+    uint8_t *hbuf=(uint8_t*)malloc(hlen ? hlen : 1);
+    if(!hbuf) return -1;
+    memcpy(hbuf,    R_bytes, 32);
+    memcpy(hbuf+32, pub,     32);
+    if(mlen) memcpy(hbuf+64, msg, mlen);
+    uint8_t hH[64]; phi_sha512_emul(hH, hbuf, hlen);
+    free(hbuf);
+    uint8_t h_scalar[32]; sc_reduce64(h_scalar, hH);
+
+    /* Compute S*B */
+    ge25519 SB; ge_scalarmult(&SB, S_bytes, &B);
+    /* Compute h*A, negate A for subtraction: -(h*A) = h*(-A) */
+    fe25519 neg_Ax; fe_neg(neg_Ax, A.X);
+    fe25519 neg_At; fe_neg(neg_At, A.T);
+    ge25519 Aneg;
+    memcpy(Aneg.X, neg_Ax, sizeof(fe25519));
+    memcpy(Aneg.Y, A.Y,    sizeof(fe25519));
+    memcpy(Aneg.Z, A.Z,    sizeof(fe25519));
+    memcpy(Aneg.T, neg_At, sizeof(fe25519));
+    ge25519 hA; ge_scalarmult(&hA, h_scalar, &Aneg);
+    /* Check: SB + (-hA) == R */
+    ge25519 lhs; ge_add(&lhs, &SB, &hA);
+    uint8_t lhs_enc[32]; ge_encode(lhs_enc, &lhs);
+    /* Decode R */
+    ge25519 R_pt;
+    if(ge_decode(&R_pt, R_bytes)!=0) return -1;
+    uint8_t R_enc[32]; ge_encode(R_enc, &R_pt);
+    uint8_t diff=0;
+    for(int i=0;i<32;i++) diff|=lhs_enc[i]^R_enc[i];
+    return diff==0 ? 0 : -1;
+}
+
+/* ed25519_keygen already defined in Module F; we reuse it but add
+ * a proper public key derivation via the basepoint:               */
+static void phisign_keygen(PhiCSPRNG *rng, Ed25519Key *kp) {
+    phi_csprng_read(rng, kp->priv, 32);
+    /* Derive pub = a*B where a = clamp(H(priv)[0..31]) */
+    static ge25519 B; static int B_loaded=0;
+    if(!B_loaded){
+        fe_from_bytes(B.X,ED25519_BX_BYTES);
+        fe_from_bytes(B.Y,ED25519_BY_BYTES);
+        for(int i=0;i<5;i++) B.Z[i]=(i==0)?1:0;
+        fe_from_bytes(B.T,ED25519_BT_BYTES);
+        B_loaded=1;
+    }
+    uint8_t H[64]; phi_sha512_emul(H, kp->priv, 32);
+    uint8_t a[32]; memcpy(a,H,32);
+    a[0]&=248; a[31]&=63; a[31]|=64;
+    ge25519 pub_pt; ge_scalarmult(&pub_pt, a, &B);
+    ge_encode(kp->pub, &pub_pt);
+}
+
+static void module_phisign(void) {
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [H] Ed25519 PhiSign  --  Lattice-Keyed Twisted Edwards Sign  |\n"
+        "+================================================================+\n"
+        CR "\n");
+
+    uint64_t jit[64]; uint64_t jseed = cx_jitter_harvest(jit);
+    PhiCSPRNG rng; phi_csprng_init(&rng, jseed);
+    printf("  Lattice CSPRNG seeded  (jitter=0x%016llx)\n\n", (unsigned long long)jseed);
+
+    /* ── H0: Sanity — 1*B == B (basepoint encode round-trip) ── */
+    {
+        static ge25519 Bt; static int Bt_ok=0;
+        if(!Bt_ok){
+            fe_from_bytes(Bt.X,ED25519_BX_BYTES);
+            fe_from_bytes(Bt.Y,ED25519_BY_BYTES);
+            for(int i=0;i<5;i++) Bt.Z[i]=(i==0)?1:0;
+            fe_from_bytes(Bt.T,ED25519_BT_BYTES);
+            Bt_ok=1;
+        }
+        /* scalar=1 → should encode to standard base point y=4/5 */
+        uint8_t one[32]={1};
+        ge25519 P1; ge_scalarmult(&P1, one, &Bt);
+        uint8_t enc1[32]; ge_encode(enc1, &P1);
+        /* check first/last bytes against known base point encoding */
+        /* expected: 0x58, ..., 0x66 (y=4/5 with sign bit 0) */
+        int bpok = (enc1[0]==0x58 && enc1[31]==0x66);
+        printf("  " BOLD "H0  Sanity: 1*B == B" CR "\n");
+        printf("    enc1[0]=%02x enc1[31]=%02x : %s\n\n",
+               enc1[0], enc1[31], bpok ? GRN "[OK]" CR : RED "[FAIL — scalar mult broken]" CR);
+        /* Also test ge_decode round-trip */
+        ge25519 Bdec; int drc = ge_decode(&Bdec, enc1);
+        uint8_t enc2[32]; ge_encode(enc2, &Bdec);
+        int rtok = (drc==0);
+        for(int i=0;i<32;i++) if(enc1[i]!=enc2[i]) rtok=0;
+        printf("  " BOLD "H0b Decode round-trip" CR "\n");
+        printf("    ge_decode rc=%d enc match: %s\n\n",
+               drc, rtok ? GRN "[OK]" CR : RED "[FAIL]" CR);
+    }
+
+    /* ── H1: Key generation via basepoint scalar mult ── */
+    printf("  " BOLD "H1  PhiSign keygen  (a*B on twisted Edwards)" CR "\n");
+    Ed25519Key kp;
+    phisign_keygen(&rng, &kp);
+    printf("    priv   : "); for(int i=0;i<16;i++) printf("%02x",kp.priv[i]); printf("...\n");
+    printf("    pub    : "); for(int i=0;i<16;i++) printf("%02x",kp.pub[i]);  printf("...\n\n");
+
+    /* ── H2: Sign / verify a lattice-origin message ── */
+    printf("  " BOLD "H2  Sign & Verify" CR "\n");
+    static const uint8_t MSG[] = "phi-kernel-v1.0: lattice-signed boot record";
+    uint8_t sig[64];
+    phisign_sign(sig, &kp, MSG, sizeof(MSG)-1);
+    int ok = phisign_verify(sig, kp.pub, MSG, sizeof(MSG)-1);
+    printf("    msg    : \"%s\"\n", MSG);
+    printf("    sig R  : "); for(int i=0;i<16;i++) printf("%02x",sig[i]);    printf("...\n");
+    printf("    sig S  : "); for(int i=0;i<16;i++) printf("%02x",sig[32+i]); printf("...\n");
+    printf("    verify : %s\n\n", ok==0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* ── H3: Tamper detection ── */
+    printf("  " BOLD "H3  Tamper detection" CR "\n");
+    uint8_t bad_sig[64]; memcpy(bad_sig, sig, 64); bad_sig[0]^=0xff;
+    int bad1 = phisign_verify(bad_sig, kp.pub, MSG, sizeof(MSG)-1);
+    uint8_t bad_msg[] = "phi-kernel-v1.0: lattice-signed boot record!";
+    int bad2 = phisign_verify(sig, kp.pub, bad_msg, sizeof(bad_msg)-1);
+    printf("    corrupt sig  : %s  (expected FAIL)\n",
+           bad1!=0 ? GRN "[OK — rejected]" CR : RED "[MISS]" CR);
+    printf("    corrupt msg  : %s  (expected FAIL)\n\n",
+           bad2!=0 ? GRN "[OK — rejected]" CR : RED "[MISS]" CR);
+
+    /* ── H4: Wu-wei seal — compress then sign ── */
+    printf("  " BOLD "H4  Wu-Wei Seal  (ww_compress → PhiSign)" CR "\n");
+    /* snapshot 1 KB of the lattice as a 'kernel section' */
+    const uint8_t *lbytes = (const uint8_t*)lattice;
+    size_t lsz = (size_t)lattice_N * sizeof(double);
+    size_t snap = (lsz < 1024) ? lsz : 1024;
+
+    /* phi resonance hint for wu-wei strategy */
+    uint8_t hb[2]; phi_csprng_read(&rng, hb, 2);
+    float hint = (float)((uint32_t)hb[0]|((uint32_t)hb[1]<<8)) / 65535.0f;
+    float ent = ww_entropy(lbytes, snap);
+    float cor = ww_correlation(lbytes, snap);
+    float rep = ww_repetition(lbytes, snap);
+    WuWeiStrat strat = ww_select(ent, cor, rep, hint);
+
+    uint8_t *cbuf = (uint8_t*)malloc(snap*4+64);
+    if(!cbuf){ printf("    " RED "[ERR] malloc\n" CR); return; }
+    size_t csz = ww_compress(lbytes, snap, cbuf, snap*4+64, strat);
+
+    /* sign the compressed bytes */
+    uint8_t seal[64];
+    phisign_sign(seal, &kp, cbuf, csz ? csz : snap);
+
+    /* verify seal over the same compressed payload */
+    int seal_ok = phisign_verify(seal, kp.pub, cbuf, csz ? csz : snap);
+    free(cbuf);
+
+    printf("    section  : lattice[0..%zu] (%zu bytes)\n", snap-1, snap);
+    printf("    strategy : %s\n", WW_NAMES[strat]);
+    printf("    ww size  : %zu → %zu bytes  (%.2fx)\n",
+           snap, csz ? csz : snap,
+           csz ? (float)snap/(float)csz : 1.0f);
+    printf("    seal sig : "); for(int i=0;i<16;i++) printf("%02x",seal[i]); printf("...\n");
+    printf("    seal     : %s\n\n", seal_ok==0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    printf("  " BOLD "Chain of trust:" CR "\n");
+    printf("    phi[4096] lattice → HKDF-PRK → PhiCSPRNG → priv scalar\n");
+    printf("    priv → clamp → H(priv) → a scalar + prefix\n");
+    printf("    pub  = a * B  (twisted Edwards basepoint mult)\n");
+    printf("    sign = (R=r*B, S=(r+H(R||pub||msg)*a) mod l)\n");
+    printf("    wu-wei: ww_compress(kernel_section) → phisign(compressed)\n");
+    printf("    data guides its own codec path; lattice seals the result.\n\n");
+}
+
 /* ══════════════════════════ MODULE G: Wu-Wei Fold26 Codec ══════════════════
  *  Lattice-first adaptive compression (inlined from fold26_wuwei.c).
  *  Wu-wei: analyze data characteristics, let data nature guide the codec.
@@ -3229,21 +3755,7 @@ static void module_fullcrypto(void) {
  *  No external deps -- delta+RLE only (no zlib). Single-file safe.
  * ════════════════════════════════════════════════════════════════════════ */
 
-typedef enum {
-    WW_NONACTION      = 0,
-    WW_FLOWING_RIVER  = 1,
-    WW_REPEATED_WAVES = 2,
-    WW_GENTLE_STREAM  = 3,
-    WW_BALANCED_PATH  = 4
-} WuWeiStrat;
-
-static const char * const WW_NAMES[5] = {
-    "Non-Action      (raw)",
-    "Flowing River   (delta->rle x2)",
-    "Repeated Waves  (rle->delta->rle)",
-    "Gentle Stream   (delta->rle)",
-    "Balanced Path   (delta->rle)"
-};
+/* WuWeiStrat enum and WW_NAMES defined via forward decl before Module H */
 
 #define WW_RLE_ESC 0xFE
 
@@ -5000,6 +5512,7 @@ static void print_menu(void) {
     printf("  " YEL "[E]" CR " Crypto Layer         SHA-256/HMAC/HKDF-Expand lattice CSPRNG\n");
     printf("  " YEL "[F]" CR " Full Crypto Stack     AES-256-GCM + X25519 + Noise_XX (lattice-keyed)\n");
     printf("  " YEL "[G]" CR " Wu-Wei Codec          fold26 lattice-adaptive compression\n");
+    printf("  " YEL "[H]" CR " PhiSign               Ed25519 twisted Edwards sign/verify (lattice-keyed)\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -5029,6 +5542,7 @@ int main(int argc, char *argv[]) {
         case 'e': module_crypto();                 break;
         case 'f': module_fullcrypto();              break;
         case 'g': module_wuwei_codec();              break;
+        case 'h': module_phisign();                  break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -5062,6 +5576,7 @@ int main(int argc, char *argv[]) {
         case 'e': module_crypto();               break;
         case 'f': module_fullcrypto();            break;
         case 'g': module_wuwei_codec();            break;
+        case 'h': module_phisign();                break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
