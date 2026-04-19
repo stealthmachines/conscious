@@ -99,6 +99,31 @@ The GPU Track A scanner evaluates the Riemann explicit formula with up to 10 000
 zeta zeros to assign each candidate a primality confidence score, eliminating
 composites before the expensive squaring step.
 
+**8. HDGL Analog Mainnet V3.0 — standalone Dₙ(r) lattice engine (`hdgl_analog_v30.c`).**
+A self-contained lattice engine that runs the Dₙ(r) resonance field as a first-class
+system, decoupled from the LL verifier.  Up to 8 388 608 `Slot4096` slots in
+1 MB lazy-allocated chunks; each slot carries a full Dₙ(r) state alongside its
+arbitrary-precision mantissa.
+
+- **8 lattice dimensions (D1–D8)** — dimension n∈{1..8}, radial position r∈[0,1],
+  wave mode ∈{−1, 0, +1}.  `Dₙ(r) = √(φ·Fₙ·2ⁿ·Pₙ·Ω) · r^((n+1)/8)`
+- **NumericLattice** — Base(∞) seed table (64 φ-spaced values): upper field
+  (1.618–170.618), 13-entry analog-dimension ladder, the void (0), lower field
+  (10⁻¹⁰–0.618), sibling harmonics.
+- **Dₙ-modulated RK4 coupling** — `Dₙ_coupling = Dₙ(neigh) · e^(−|Dₙ(neigh)−Dₙ(slot)|)`;
+  correlated dimensions couple strongly; divergent dimensions decouple naturally.
+- **Harmonic consensus detection** — phase variance σ monitored every step;
+  σ < 10⁻⁶ for 100 consecutive steps sets `APA_FLAG_CONSENSUS` (domain lock).
+- **Checkpoint manager** — up to 10 snapshots, exponential weight decay ×0.95;
+  evicts lowest-weight snapshot when full.
+- **Shared-library form** — `hdgl_analog_v30_c_so/hdgl_analog_v30.c` compiles as
+  a `.so`/`.dll`; callable from Python/ctypes or linked directly.
+
+**9. Prime Library TUI (`prime_ui.exe`) — interactive Windows console for all prime math.**
+A self-contained menu-driven TUI (no external dependencies) covering all 13 library
+functions: Prime Pipeline, Number Analyzer, Mersenne Explorer, Zeta Zeros viewer,
+and a microsecond-resolution Benchmark.  See [Track E](#track-e--prime-library-tui-prime_uiexe) below.
+
 ---
 
 ## Architecture
@@ -121,6 +146,10 @@ ll_mpi.exe <p>
 | B | phi_mersenne_predictor.c | phi-lattice analysis of all 51 known exponents |
 | C | ll_mpi.cu | Lucas-Lehmer verifier — exact integer, no DWT, no cuFFT |
 | D | prime_pipeline.c | phi-filter + D_n ranker + sieve |
+| E | prime_ui.c | Windows TUI — interactive prime library (5 modules) |
+| — | ll_analog.c | v30b Slot4096 APA + 8D Kuramoto oscillator (CPU, CUDA-free) |
+| — | hdgl_analog_v30.c | HDGL Analog Mainnet V3.0 — standalone Dₙ(r) lattice engine |
+| — | bench_prime_funcs.c | 13-function tri-compiler benchmark harness |
 
 ---
 
@@ -494,6 +523,109 @@ Segmented sieve + phi-lattice D_n scoring:
 .\prime_pipeline.exe 21000 22000 --top 10 --exponents-only |
   ForEach-Object { .\ll_mpi.exe $_ }
 ```
+
+---
+
+## Track E — Prime Library TUI (`prime_ui.exe`)
+
+Interactive Windows console application covering the entire quantum-prime math
+library.  Self-contained (no external dependencies beyond MSVCRT + kernel32);
+all 13 prime functions inlined from `bench_prime_funcs.c`, `prime_pipeline.c`,
+`phi_mersenne_predictor.c`, and `ll_analog.c`.
+
+| Key | Module | Description |
+|-----|--------|-------------|
+| `1` | **Prime Pipeline** | Enter [p_lo, p_hi] → sieve → φ-filter → Dₙ-rank → sorted ANSI table; range cap 5 M |
+| `2` | **Number Analyzer** | Enter n → 12-witness Miller-Rabin, n(2ᵖ) lattice coord, frac(n), Dₙ score, ψ-score (B=80 zeros), small factorization, Mersenne check |
+| `3` | **Mersenne Explorer** | All 51 known M_p with n(2ᵖ), frac, φ-pass, Dₙ score (paginated); 14 next-candidate predictions via φ-lattice inverse x(n) = φ^(φ^(n+1/(2φ))) |
+| `4` | **Zeta Zeros** | ζ(½+it) zeros k=0..K — exact table (k<80), Gram/6-iter-Newton approximation (k≥80) |
+| `5` | **Benchmark** | µs/ns-resolution timing of all 13 prime library functions |
+
+**Build:** `build_prime_ui.bat`  (requires clang 14+; also supports `--gcc`, `--msvc`, `--all`)
+
+```bat
+.\build_prime_ui.bat
+```
+
+**Usage:** `.\prime_ui.exe`  — single-key menu navigation; `Q` to quit.
+
+---
+
+## HDGL Analog Mainnet V3.0 (`hdgl_analog_v30.c`)
+
+Standalone lattice engine implementing the Dₙ(r) resonance field as a
+first-class system.  Compiled as a shared library (`hdgl_analog_v30_c_so/`)
+or as a standalone executable.
+
+### Key Structures
+
+| Structure | Purpose |
+|-----------|---------|
+| `NumericLattice` | Base(∞) seeds: 64 φ-spaced values across upper field, 13-D analog ladder, void, lower field, sibling harmonics, infinity/choke layers |
+| `Slot4096` | APA mantissa (`uint64_t[]`) + Dₙ(r) state: `dimension_n`, `r_value`, `Dn_amplitude`, `wave_mode`, phase/vel/freq |
+| `HDGLChunk` | 1 M slots, lazy-allocated; `HDGLLattice` holds up to 8 388 608 slots across chunks |
+| `AnalogLink` | Neighbor coupling: `charge`, `charge_im`, `tension`, `potential`, `Dn_coupling` |
+| `CheckpointMeta` | Snapshot: evolution, timestamp, phase variance, omega, exponential weight |
+
+### Dₙ(r) Formula
+
+    Dₙ(r) = √( φ · Fₙ · 2ⁿ · Pₙ · Ω ) · r^k     k = (n+1)/8
+
+where Fₙ ∈ {1,1,2,3,5,8,13,21} (Fibonacci), Pₙ ∈ {2,3,5,7,11,13,17,19} (prime table),
+Ω is the driving frequency, and k = (n+1)/8 scales radial exponent by dimension.
+
+### Dynamics
+
+- **RK4 integration** — `rk4_step_Dn`: amplitude (re, im), phase, phase velocity, and
+  `Dn_val` all evolved simultaneously; 4-stage classical Runge-Kutta.
+- **Wave mode influence** — phase velocity bias `+0.3·wave_mode` per step;
+  D1,D4,D7 = +1 (propagating), D2,D5,D8 = 0 (standing), D3,D6 = −1 (absorbing).
+- **φ-adaptive time step** — dt multiplied/divided by φ when |A| crosses `ADAPT_THRESH=0.8`;
+  clamped to [10⁻⁶, 0.1].
+- **Entropy dampers** — amplitude decays `exp(−λ·dt)`, saturated at 10⁶, plus
+  `NOISE_SIGMA=0.01` white noise injection each step.
+- **Consensus lock** — phase variance σ < 10⁻⁶ for 100 steps → all slots flagged
+  `APA_FLAG_CONSENSUS`, phase velocities zeroed.
+
+### Operational Constants
+
+| Constant | Value | Role |
+|----------|-------|------|
+| `GAMMA` | 0.02 | Amplitude damping coefficient |
+| `LAMBDA` | 0.05 | Entropy decay rate |
+| `K_COUPLING` | 1.0 | Base Kuramoto coupling strength |
+| `CONSENSUS_EPS` | 10⁻⁶ | Phase-variance lock threshold |
+| `CONSENSUS_N` | 100 | Steps below threshold required for lock |
+| `SNAPSHOT_DECAY` | 0.95 | Checkpoint weight decay per step |
+
+**Build (Linux / MSYS2):**
+```sh
+gcc -O2 -lm hdgl_analog_v30.c -o hdgl_analog_v30
+```
+
+**Build (Windows, clang):**
+```bat
+clang -O2 -D_CRT_SECURE_NO_WARNINGS -D_USE_MATH_DEFINES hdgl_analog_v30_c_so\hdgl_analog_v30.c -o hdgl_v30.exe
+```
+
+---
+
+## Benchmark Harness (`bench_prime_funcs.c`)
+
+Tri-compiler standalone benchmark measuring all 13 prime library functions
+under clang / GCC 15.2 / MSVC /O2.  Results written to `bench_prime_results.tsv`.
+
+| Function | clang | GCC 15.2 | MSVC /O2 |
+|----------|-------|----------|----------|
+| `fibonacci_real` | 0.10 µs | 0.11 µs | 0.08 µs |
+| `D_n` operator | 0.17 µs | 0.41 µs | 0.19 µs |
+| `gram_zero_k` | 0.16 µs | 0.38 µs | 0.15 µs |
+| `psi_score_cpu` (B=500) | 102 µs | 212 µs | 103 µs |
+| `miller_rabin` (12 w) | 1.90 µs | 1.41 µs | 3.07 µs |
+| `sieve_range` [1e7,+1e5] | 587 µs | 627 µs | 589 µs |
+| full pipeline (200 K) | 1 114 µs | 1 259 µs | 938 µs |
+
+**Build:** `build_bench_quantum.bat`
 
 ---
 

@@ -31,7 +31,7 @@ set FLAGS=-std=c11 -O2 -Wall -Wno-unused-function ^
 set OUT=bot.exe
 
 echo [build] Compiling analog bot...
-"%CLANG%" %SRC% %FLAGS% -o %OUT%
+"%CLANG%" %SRC% %FLAGS% -o %OUT% -lws2_32
 
 if errorlevel 1 (
     echo [FAILED] Build errors above.
@@ -44,6 +44,7 @@ echo Usage:
 echo   bot.exe                                    -- chat (seeds HDGL fresh)
 echo   bot.exe --hdgl-load hdgl_lattice_corpus.bin -- load corpus-seeded lattice
 echo   bot.exe --corpus ..\pipeline\sft\train.jsonl -- explicit corpus path
+echo   bot.exe --serve 8000                        -- HTTP server on localhost:8000
 echo   bot.exe --verbose                           -- show per-word routing stats
 echo.
 

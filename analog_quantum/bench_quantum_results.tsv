@@ -1,0 +1,14 @@
+function	mean_us	min_us	max_us	iters	ops_per_sec
+qosc_create (alloc + encode phases)	10.1946	3.6000	281.4000	500	98091.15
+qosc_encode (state reset + 8 Ry gates)	6.6585	3.2000	4677.4000	5000	150183.98
+qosc_destroy (free device memory)	1.0662	0.0000	139.0000	500	937910.31
+qosc_step (1 XY Trotter step)	69.6838	33.7000	2081.3000	5000	14350.54
+qosc_readback (16 Pauli expectations)	0.1479	0.0000	168.1000	5000	6763154.44
+qosc_create + qosc_destroy	13.6448	2.4000	1839.0000	500	73287.99
+qosc_step sub: 8 Rz gates (freq drive)	4.3718	1.7000	1211.2000	10000	228738.21
+qosc_step sub: 28 XX+YY pairs (coupling)	69.8340	28.6000	2537.6000	5000	14319.68
+qosc_step x10000 sustained (pure throughput)	91.0068	0.0000	0.0000	10000	10988.19
+Full cycle: create→1×step→readback→destroy	84.6288	50.8000	303.9000	500	11816.31
+Full cycle: create→10×step→readback→destroy	732.8176	512.8000	3086.3000	500	1364.60
+Full cycle: create→100×step→readback→destroy	5071.3238	3271.2000	10899.9000	500	197.19
+Full cycle: create→1000×step→readback→destroy	53764.7700	39520.4000	73697.0000	50	18.60
