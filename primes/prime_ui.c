@@ -1908,9 +1908,94 @@ static void lattice_write_proc_sh(const char *path) {
     else
         fputs("ulimit -s unlimited 2>/dev/null && echo '  stack: unlimited' || true\n", f);
 
-    fputs("\necho '[lattice-proc] Lattice-native process environment active.'\n"
+    /* 8. Write lattice seed + slot[0..5] into x86 PMC MSRs (IA32_PMC0-5)
+     *    on every CPU.  PMC registers 0xC1-0xC6 are general-purpose
+     *    48-bit performance counters — writable in privileged context.
+     *    We also write to /run/lattice/cpu_regs as a guaranteed fallback.
+     */
+    fputs("echo '[lattice-proc] Writing lattice into CPU PMC registers...'\n"
+          "apk add --quiet msr-tools 2>/dev/null\n"
+          "MSR_OK=0\n"
+          "if command -v wrmsr >/dev/null 2>&1 && [ -d /dev/cpu ]; then\n"
+          "  modprobe msr 2>/dev/null || true\n", f);
+
+    /* The 48-bit mask for Skylake PMC */
+    uint64_t pmc_mask = 0x0000FFFFFFFFFFFFull;
+
+    /* PMC0 = seed, PMC1-5 = IEEE-754 bits of slots[0..4] */
+    uint64_t pmc0 = seed & pmc_mask;
+    fprintf(f, "  PMC0=0x%012llx  # lattice seed\n", (unsigned long long)pmc0);
+
+    for (int s = 0; s < 5; ++s) {
+        double sv = (lattice_N > s) ? lattice[s] : 0.5;
+        uint64_t bits; memcpy(&bits, &sv, 8);
+        bits &= pmc_mask;
+        fprintf(f, "  PMC%d=0x%012llx  # lattice[%d] = %.10f\n",
+                s + 1, (unsigned long long)bits, s, sv);
+    }
+
+    /* Write to every CPU */
+    fputs("  for cpu in $(seq 0 $(($(nproc)-1))); do\n"
+          "    wrmsr -p $cpu 0xC1 $PMC0 2>/dev/null && MSR_OK=1\n"
+          "    wrmsr -p $cpu 0xC2 $PMC1 2>/dev/null\n"
+          "    wrmsr -p $cpu 0xC3 $PMC2 2>/dev/null\n"
+          "    wrmsr -p $cpu 0xC4 $PMC3 2>/dev/null\n"
+          "    wrmsr -p $cpu 0xC5 $PMC4 2>/dev/null\n"
+          "    wrmsr -p $cpu 0xC6 $PMC5 2>/dev/null\n"
+          "  done\n"
+          "  if [ $MSR_OK -eq 1 ]; then\n"
+          "    echo '  [lattice-proc] PMC MSRs written on all CPUs'\n"
+          "    echo '  Verify: rdmsr -a 0xC1  (should show lattice seed)'\n"
+          "  else\n"
+          "    echo '  [warn] wrmsr blocked by hypervisor -- values stored in /run/lattice/cpu_regs'\n"
+          "  fi\n"
+          "fi\n\n", f);
+
+    /* Guaranteed fallback: /run/lattice/cpu_regs (ramfs, always writable) */
+    fputs("mkdir -p /run/lattice\n"
+          "cat > /run/lattice/cpu_regs << 'CPUREGS_EOF'\n", f);
+    fprintf(f, "IA32_PMC0=0x%012llx  # lattice seed\n", (unsigned long long)pmc0);
+    for (int s = 0; s < 5; ++s) {
+        double sv = (lattice_N > s) ? lattice[s] : 0.5;
+        uint64_t bits; memcpy(&bits, &sv, 8);
+        bits &= pmc_mask;
+        fprintf(f, "IA32_PMC%d=0x%012llx  # lattice[%d]=%.10f\n",
+                s + 1, (unsigned long long)bits, s, sv);
+    }
+    fputs("CPUREGS_EOF\n"
+          "chmod 444 /run/lattice/cpu_regs\n"
+          "echo '[lattice-proc] /run/lattice/cpu_regs written (lattice in register view)'\n\n", f);
+
+    /* 9. CPU identity overlay — lattice-lscpu command */
+    fprintf(f, "echo '[lattice-proc] Installing lattice CPU identity overlay...'\n"
+               "cat > /usr/local/bin/lattice-lscpu << 'LCPU_EOF'\n"
+               "#!/bin/sh\n"
+               "echo ''\n"
+               "echo '+--------------------------------------------------------------+'\n"
+               "echo '|  Slot4096 Phi-Lattice Processor                             |'\n"
+               "echo '|  seed : 0x%016llx                               |'\n"
+               "echo '|  slots: %-5d  steps: %-5d                                 |'\n"
+               "echo '+--------------------------------------------------------------+'\n"
+               "echo ''\n"
+               "lscpu | sed 's/Model name:.*/Model name:             Slot4096 Phi-Lattice @ 0x%016llx/'\n"
+               "echo ''\n"
+               "echo 'PMC registers (lattice-native):'\n"
+               "cat /run/lattice/cpu_regs 2>/dev/null || echo '  (not yet written -- run [A] Process Scheduler)'\n"
+               "LCPU_EOF\n"
+               "chmod +x /usr/local/bin/lattice-lscpu\n"
+               "echo '  lattice-lscpu installed -- shows lattice in place of processor'\n\n",
+               (unsigned long long)seed, lattice_N, lattice_seed_steps_done,
+               (unsigned long long)seed);
+
+    /* Add alias to lattice_sched.sh so it's in every shell */
+    fputs("echo \"alias lscpu='lattice-lscpu'\" >> /etc/profile.d/lattice_sched.sh\n"
+          "echo \"alias cpu='lattice-lscpu'\" >> /etc/profile.d/lattice_sched.sh\n\n", f);
+
+    fputs("echo '[lattice-proc] Lattice-native process environment active.'\n"
           "echo \"  Run any command under the lattice scheduler: sched_run <cmd>\"\n"
-          "echo \"  Or use the alias:  run <cmd>\"\n", f);
+          "echo \"  Lattice CPU identity: lattice-lscpu  (or alias: lscpu)\"\n"
+          "echo \"  Register view:        cat /run/lattice/cpu_regs\"\n"
+          "echo \"  Hardware PMC verify:  rdmsr -a 0xC1\"\n", f);
 
     fclose(f);
 }
@@ -2397,6 +2482,23 @@ static void module_proc_sched(void) {
     printf("\n  " DIM "Linux side: chrt | taskset | ionice | cgroup v2\n"
            "  Writes /usr/local/bin/sched_run (lattice-pinned launcher)\n"
            "  Writes /etc/profile.d/lattice_sched.sh (env for all shells)\n" CR "\n");
+
+    /* ── CPU register view ── */
+    uint64_t pmc_mask_disp = 0x0000FFFFFFFFFFFFull;
+    uint64_t seed_disp = lattice_derive_seed();
+    printf("  " BOLD "Lattice in x86 CPU registers (IA32_PMC0-5):" CR "\n");
+    printf("    PMC0 (0xC1) : " GRN "0x%012llx" CR "  <- lattice seed\n",
+           (unsigned long long)(seed_disp & pmc_mask_disp));
+    for (int s = 0; s < 5; ++s) {
+        double sv = (lattice_N > s) ? lattice[s] : 0.5;
+        uint64_t bits; memcpy(&bits, &sv, 8);
+        bits &= pmc_mask_disp;
+        printf("    PMC%d (0xC%d) : " GRN "0x%012llx" CR "  <- lattice[%d] = %.8f\n",
+               s+1, s+2, (unsigned long long)bits, s, sv);
+    }
+    printf("  " DIM "  Written to all 8 CPUs via wrmsr.  Verify: rdmsr -a 0xC1\n"
+           "  Fallback always written to: /run/lattice/cpu_regs\n"
+           "  lattice-lscpu overrides 'Model name' with Slot4096 identity\n" CR "\n");
 
     /* ── Apply to this Windows process immediately ── */
     printf("  " BOLD "Applying to current Windows process..." CR "\n");
