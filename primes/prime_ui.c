@@ -1498,7 +1498,7 @@ static void module_alpine_os(void) {
                    "  " DIM "(Detach: Ctrl-P Ctrl-Q   |   New shell: docker exec -it phi4096-lattice bash)\n"
                    CR "\n");
             fflush(stdout);
-            system("docker exec -it phi4096-lattice su - slot4096 -s /bin/bash 2>/dev/null "
+            system("docker exec -it phi4096-lattice su - slot4096 2>nul "
                    "|| docker exec -it phi4096-lattice bash");
 
         } else {
@@ -1633,6 +1633,17 @@ static void print_banner(void) {
 }
 
 static void print_menu(void) {
+    /* Check if the lattice container is currently running */
+    int live = 0;
+    {
+        FILE *cp = _popen("docker inspect --format={{.State.Status}} phi4096-lattice 2>NUL", "r");
+        if (cp) {
+            char st[32] = {0};
+            if (fgets(st, sizeof(st), cp) && strstr(st, "running")) live = 1;
+            _pclose(cp);
+        }
+    }
+
     printf(WHT "  Main Menu\n" CR);
     printf("  " YEL "[1]" CR " Prime Pipeline       sieve -> phi-filter -> Dn-rank\n");
     printf("  " YEL "[2]" CR " Number Analyzer      Miller-Rabin, phi-lattice, Dn, psi\n");
@@ -1641,7 +1652,10 @@ static void print_menu(void) {
     printf("  " YEL "[5]" CR " Benchmark            time all 13 prime functions\n");
     printf("  " YEL "[6]" CR " Alpine Install       boot lattice + GPU resonance hook\n");
     printf("  " YEL "[7]" CR " Lattice Shell        interactive Slot4096 REPL\n");
-    printf("  " YEL "[8]" CR " Alpine OS Shell      spawn lattice-powered Alpine Linux\n");
+    if (live)
+        printf("  " YEL "[8]" CR " Alpine OS Shell      " GRN "[live: phi4096-lattice]" CR " re-attach\n");
+    else
+        printf("  " YEL "[8]" CR " Alpine OS Shell      spawn lattice-powered Alpine Linux\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
