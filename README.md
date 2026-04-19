@@ -6,7 +6,7 @@
 > GPU warps, CPU phi-lattice math, and an interactive Windows TUI with no
 > external crypto dependencies.
 
-**GPU target:** NVIDIA RTX 2060 12 GB (CUDA sm_75) · **OS:** Windows 10/11 · **Compiler:** clang 14+
+**GPU target:** NVIDIA RTX 2060 12 GB (CUDA sm_75) · **OS:** Windows 10/11 · Linux x86-64 · **Compiler:** clang 14+
 
 ---
 
@@ -39,6 +39,7 @@
 14. [Use Cases](#use-cases)
 15. [Requirements](#requirements)
 16. [Build Reference](#build-reference)
+17. [Linux Port (`prime_ui_posix/`)](#linux-port-prime_ui_posix)
 
 ---
 
@@ -874,10 +875,118 @@ build_prime_ui.bat --all         REM all three compilers
 
 ### Linux / MSYS2 notes
 
-Remove `-D_CRT_SECURE_NO_WARNINGS`. The entropy subsystem uses
-`QueryPerformanceCounter` and `GetSystemTimeAsFileTime` (Windows-only);
-POSIX equivalents can be substituted with `clock_gettime(CLOCK_MONOTONIC)`
-and `clock_gettime(CLOCK_REALTIME)` respectively.
+A complete POSIX/Linux port lives in `prime_ui_posix/`. See
+[Linux Port](#linux-port-prime_ui_posix) below for build instructions.
+
+---
+
+## Linux Port (`prime_ui_posix/`)
+
+Added April 2026 — tagged [`linux-port`](https://github.com/stealthmachines/conscious/releases/tag/linux-port)
+and [`posix-compat`](https://github.com/stealthmachines/conscious/releases/tag/posix-compat).
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `prime_ui_posix/prime_ui_posix.c` | Full source port of `prime_ui.c` for Linux/POSIX |
+| `prime_ui_posix/posix_compat.h` | Platform shim: maps every Windows API to its POSIX equivalent |
+| `prime_ui_posix/Makefile` | Linux build with correct CPU feature flags |
+
+### Quick build (Linux x86-64)
+
+```bash
+# Requires: clang 14+ or GCC 11+, Linux 3.17+ (getrandom syscall)
+git clone https://github.com/stealthmachines/conscious
+cd conscious/prime_ui_posix
+make
+./prime_ui
+```
+
+To use a specific tag:
+
+```bash
+git clone --branch linux-port https://github.com/stealthmachines/conscious
+cd conscious/prime_ui_posix && make
+```
+
+### Build variants
+
+```bash
+make                # default: clang
+make CC=gcc         # GCC
+make ASAN=1         # AddressSanitizer + UBSan
+make install        # installs to /usr/local/bin/prime_ui
+make clean
+```
+
+Compiler flags applied:
+
+```
+-O2 -mavx2 -mfma -msse4.1 -maes -mpclmul -mrdseed -mrdrnd -D_GNU_SOURCE -lm
+```
+
+### CLI module shortcuts (same as Windows)
+
+```bash
+./prime_ui r        # PhiKernel — fully phi-native kernel (no SHA/AES/BCrypt/XOR)
+./prime_ui s        # Observer/MITM View
+./prime_ui i        # Lattice Kernel (lk_read / lk_advance / lk_commit)
+./prime_ui e        # Crypto Layer
+./prime_ui 1        # Prime Pipeline
+```
+
+### What `posix_compat.h` provides
+
+| Windows API | POSIX replacement |
+|-------------|-------------------|
+| `windows.h` / `bcrypt.h` | suppressed; replaced by `posix_compat.h` |
+| `QueryPerformanceCounter` | `clock_gettime(CLOCK_MONOTONIC)` |
+| `GetSystemTimeAsFileTime` | `clock_gettime(CLOCK_REALTIME)` scaled to 100 ns ticks |
+| `BCryptGenRandom` | `getrandom()` (Linux 3.17+) / `/dev/urandom` fallback |
+| `ReadConsoleW` + `WideCharToMultiByte` | `fgets()` ASCII passthrough |
+| `SetPriorityClass` | `setpriority(PRIO_PROCESS, …)` |
+| `GetProcessAffinityMask` / `SetProcessAffinityMask` | `sched_getaffinity` / `sched_setaffinity` |
+| `Sleep(ms)` | `usleep(ms * 1000)` |
+| `GetCurrentDirectoryA` | `getcwd()` |
+| `GetFileAttributesA` | `stat()` |
+| `_popen` / `_pclose` | `popen` / `pclose` |
+| `_umul128` | `__uint128_t` (GCC/Clang intrinsic) |
+
+### Fetch a specific tag
+
+```bash
+# linux-port tag — includes prime_ui_posix/ directory
+git fetch origin refs/tags/linux-port:refs/tags/linux-port
+git checkout linux-port
+
+# posix-compat tag — same commit; named for the platform shim specifically
+git fetch origin refs/tags/posix-compat:refs/tags/posix-compat
+git checkout posix-compat
+```
+
+### Remote git reference
+
+```
+Repository:  https://github.com/stealthmachines/conscious
+Branch:      main
+Tag (port):  linux-port    — full Linux build (prime_ui_posix/)
+Tag (shim):  posix-compat  — platform-agnostic posix_compat.h shim
+Commit:      port: add POSIX/Linux port (prime_ui_posix/)
+```
+
+Verify the tags are present:
+
+```bash
+git ls-remote --tags https://github.com/stealthmachines/conscious | grep -E 'linux-port|posix-compat'
+```
+
+Expected output:
+
+```
+<sha>    refs/tags/linux-port
+<sha>    refs/tags/posix-compat
+```
 
 ---
 
