@@ -2819,7 +2819,7 @@ static void fe_from_bytes(fe25519 h, const uint8_t *s) {
     h[1]= (int64_t)((b[0]>>51 | b[1]<<13) & MASK51);
     h[2]= (int64_t)((b[1]>>38 | b[2]<<26) & MASK51);
     h[3]= (int64_t)((b[2]>>25 | b[3]<<39) & MASK51);
-    h[4]= (int64_t)((b[3]>>12) & (MASK51>>1));  /* clear top bit */
+    h[4]= (int64_t)((b[3]>>12) & MASK51);  /* clear top bit (bit 255 = pos 51 of limb) */
 }
 
 static void fe_to_bytes(uint8_t *s, const fe25519 h) {
@@ -3032,11 +3032,18 @@ static void noise_mix_hash(NoiseState *s, const uint8_t *data, size_t len) {
 
 /* MixKey: (ck, k) = HKDF(ck, input) */
 static void noise_mix_key(NoiseState *s, const uint8_t *input, size_t ilen) {
-    uint8_t out[64];
-    hkdf_expand(s->ck, input, ilen, out, 64);
-    memcpy(s->ck, out,    32);
-    memcpy(s->k,  out+32, 32);
+    /* Noise spec §4 HKDF(ck, input, 2):
+     *   temp_k  = HMAC-SHA256(ck, input)            // Extract
+     *   ck_new  = HMAC-SHA256(temp_k, \x01)         // output1
+     *   k_new   = HMAC-SHA256(temp_k, ck_new||\x02) // output2  */
+    uint8_t temp_k[32];
+    hmac_sha256(s->ck, 32, input, ilen, temp_k);
+    uint8_t b1[1] = {0x01};
+    hmac_sha256(temp_k, 32, b1, 1, s->ck);
+    uint8_t b2[33]; memcpy(b2, s->ck, 32); b2[32] = 0x02;
+    hmac_sha256(temp_k, 32, b2, 33, s->k);
     s->n = 0;
+    memset(temp_k, 0, 32);
 }
 
 /* EncryptAndHash using AES-256-GCM with the current k */
@@ -3128,14 +3135,17 @@ static void noise_xx_demo(PhiCSPRNG *rng) {
     noise_mix_key(&I_state, se, 32); noise_mix_key(&R_state, se, 32);
     printf("    MSG3 (→s,se)          : enc(Is) sent, se=DH(ie,Rs) mixed\n\n");
 
-    /* === Split: derive transport keys === */
-    uint8_t transport[64];
-    hkdf_expand(I_state.ck, (const uint8_t*)"", 0, transport, 64);
+    /* === Split: derive transport keys from both sides and compare === */
+    uint8_t I_transport[64], R_transport[64];
+    hkdf_expand(I_state.ck, (const uint8_t*)"", 0, I_transport, 64);
+    hkdf_expand(R_state.ck, (const uint8_t*)"", 0, R_transport, 64);
+    int keys_match = (memcmp(I_transport, R_transport, 64) == 0);
     printf("    Transport key (send)  : ");
-    for(int i=0;i<16;i++) printf("%02x",transport[i]); printf("...\n");
+    for(int i=0;i<16;i++) printf("%02x",I_transport[i]); printf("...\n");
     printf("    Transport key (recv)  : ");
-    for(int i=0;i<16;i++) printf("%02x",transport[32+i]); printf("...\n");
-    printf("\n    " GRN "[OK]" CR "  Noise_XX handshake complete — both parties share transport keys\n");
+    for(int i=0;i<16;i++) printf("%02x",I_transport[32+i]); printf("...\n");
+    printf("\n    %s  Noise_XX handshake complete — both parties share transport keys\n",
+           keys_match ? GRN "[OK]" CR : RED "[FAIL — keys mismatch]" CR);
     printf("    Derived from: lattice[4096] phi-resonance → HKDF-PRK → CSPRNG → X25519 ephemeral\n\n");
 }
 
@@ -3202,6 +3212,293 @@ static void module_fullcrypto(void) {
     printf("    Signing     :  " GRN "[X]" CR "  Ed25519-style keygen (PhiSign hash)\n");
     printf("    Protocol    :  " GRN "[X]" CR "  Noise_XX (3-message mutual auth)\n");
     printf("    Lattice role:  " GRN "[X]" CR "  phi[4096] resonance state seeds ALL keys\n\n");
+}
+
+/* ══════════════════════════ MODULE G: Wu-Wei Fold26 Codec ══════════════════
+ *  Lattice-first adaptive compression (inlined from fold26_wuwei.c).
+ *  Wu-wei: analyze data characteristics, let data nature guide the codec.
+ *
+ *  Strategies (fold26_wuwei.c §select_strategy):
+ *    Non-Action     - high entropy (>=7.5 bits): store raw, do nothing
+ *    Flowing River  - high correlation: delta->rle->delta->rle
+ *    Repeated Waves - high repetition: rle->delta->rle
+ *    Gentle Stream  - structured / low entropy: delta->rle
+ *    Balanced Path  - default: delta->rle
+ *
+ *  Lattice role: phi-CSPRNG resonance hint biases entropy threshold.
+ *  No external deps -- delta+RLE only (no zlib). Single-file safe.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+typedef enum {
+    WW_NONACTION      = 0,
+    WW_FLOWING_RIVER  = 1,
+    WW_REPEATED_WAVES = 2,
+    WW_GENTLE_STREAM  = 3,
+    WW_BALANCED_PATH  = 4
+} WuWeiStrat;
+
+static const char * const WW_NAMES[5] = {
+    "Non-Action      (raw)",
+    "Flowing River   (delta->rle x2)",
+    "Repeated Waves  (rle->delta->rle)",
+    "Gentle Stream   (delta->rle)",
+    "Balanced Path   (delta->rle)"
+};
+
+#define WW_RLE_ESC 0xFE
+
+/* Shannon entropy in bits/byte */
+static float ww_entropy(const uint8_t *d, size_t n) {
+    if (!n) return 0.0f;
+    uint32_t f[256] = {0};
+    for (size_t i = 0; i < n; i++) f[d[i]]++;
+    float h = 0.0f;
+    for (int i = 0; i < 256; i++) {
+        if (f[i]) { float p = (float)f[i] / (float)n; h -= p * log2f(p); }
+    }
+    return h;
+}
+
+/* Fraction of consecutive byte-pairs with |delta| <= 32 */
+static float ww_correlation(const uint8_t *d, size_t n) {
+    if (n < 2) return 0.0f;
+    uint32_t s = 0;
+    for (size_t i = 1; i < n; i++) {
+        int v = (int)d[i] - (int)d[i-1]; if (v < 0) v = -v;
+        if (v <= 32) s++;
+    }
+    return (float)s / (float)(n - 1);
+}
+
+/* Fraction of consecutive equal bytes */
+static float ww_repetition(const uint8_t *d, size_t n) {
+    if (n < 2) return 0.0f;
+    uint32_t s = 0;
+    for (size_t i = 1; i < n; i++) if (d[i] == d[i-1]) s++;
+    return (float)s / (float)(n - 1);
+}
+
+/* hint in [0,1]: higher -> lower non-action entropy threshold (more aggressive) */
+static WuWeiStrat ww_select(float ent, float cor, float rep, float hint) {
+    if (ent >= 7.5f - hint * 0.5f)  return WW_NONACTION;
+    if (cor >= 0.70f)                return WW_FLOWING_RIVER;
+    if (rep >= 0.60f)                return WW_REPEATED_WAVES;
+    if (ent <= 4.5f || cor >= 0.40f) return WW_GENTLE_STREAM;
+    return WW_BALANCED_PATH;
+}
+
+static size_t ww_delta_enc(const uint8_t *in, size_t n, uint8_t *out) {
+    if (!n) return 0;
+    out[0] = in[0];
+    for (size_t i = 1; i < n; i++) out[i] = (uint8_t)((int)in[i] - (int)in[i-1]);
+    return n;
+}
+
+static size_t ww_delta_dec(const uint8_t *in, size_t n, uint8_t *out) {
+    if (!n) return 0;
+    out[0] = in[0];
+    for (size_t i = 1; i < n; i++) out[i] = (uint8_t)((int)out[i-1] + (int)(int8_t)in[i]);
+    return n;
+}
+
+/* RLE: [ESC, val, count] for run>=3 or val==ESC; else literal byte */
+static size_t ww_rle_enc(const uint8_t *in, size_t n, uint8_t *out, size_t cap) {
+    size_t o = 0, i = 0;
+    while (i < n) {
+        size_t r = 1;
+        while (i + r < n && in[i + r] == in[i] && r < 255) r++;
+        if (r >= 3 || in[i] == WW_RLE_ESC) {
+            if (o + 3 > cap) return 0;
+            out[o++] = WW_RLE_ESC; out[o++] = in[i]; out[o++] = (uint8_t)r;
+            i += r;
+        } else {
+            if (o + 1 > cap) return 0;
+            out[o++] = in[i++];
+        }
+    }
+    return o;
+}
+
+static size_t ww_rle_dec(const uint8_t *in, size_t n, uint8_t *out, size_t cap) {
+    size_t o = 0, i = 0;
+    while (i < n) {
+        if (in[i] == WW_RLE_ESC && i + 2 < n) {
+            uint8_t v = in[i+1], c = in[i+2]; i += 3;
+            if (o + c > cap) return 0;
+            memset(out + o, v, c); o += c;
+        } else {
+            if (o + 1 > cap) return 0;
+            out[o++] = in[i++];
+        }
+    }
+    return o;
+}
+
+/* Header: [strat(1)][orig_size(4 LE)][payload...]. out must be >= n*4+8 */
+static size_t ww_compress(const uint8_t *in, size_t n, uint8_t *out, size_t cap,
+                           WuWeiStrat s) {
+    if (cap < 5 || !n) return 0;
+    out[0] = (uint8_t)s;
+    out[1] = (uint8_t)(n);        out[2] = (uint8_t)(n >> 8);
+    out[3] = (uint8_t)(n >> 16);  out[4] = (uint8_t)(n >> 24);
+    uint8_t *pl = out + 5; size_t pc = cap - 5;
+    uint8_t *t1 = (uint8_t*)malloc(n * 3 + 64);
+    uint8_t *t2 = (uint8_t*)malloc(n * 3 + 64);
+    if (!t1 || !t2) { free(t1); free(t2); return 0; }
+    size_t r = 0, t;
+    switch (s) {
+    case WW_NONACTION:
+        if (n <= pc) { memcpy(pl, in, n); r = n; }
+        break;
+    case WW_GENTLE_STREAM:
+    case WW_BALANCED_PATH:
+        t = ww_delta_enc(in, n, t1);
+        r = ww_rle_enc(t1, t, pl, pc);
+        if (!r) { if (n <= pc) { memcpy(pl, in, n); r = n; out[0] = WW_NONACTION; } }
+        break;
+    case WW_FLOWING_RIVER:
+        t = ww_delta_enc(in, n, t1);
+        t = ww_rle_enc(t1, t, t2, n*3+64); if (!t) { t = n; memcpy(t2, in, n); }
+        t = ww_delta_enc(t2, t, t1);
+        r = ww_rle_enc(t1, t, pl, pc);
+        if (!r) { if (n <= pc) { memcpy(pl, in, n); r = n; out[0] = WW_NONACTION; } }
+        break;
+    case WW_REPEATED_WAVES:
+        t = ww_rle_enc(in, n, t1, n*3+64); if (!t) { t = n; memcpy(t1, in, n); }
+        t = ww_delta_enc(t1, t, t2);
+        r = ww_rle_enc(t2, t, pl, pc);
+        if (!r) { if (n <= pc) { memcpy(pl, in, n); r = n; out[0] = WW_NONACTION; } }
+        break;
+    }
+    free(t1); free(t2);
+    return r ? r + 5 : 0;
+}
+
+static size_t ww_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t cap) {
+    if (n < 5) return 0;
+    WuWeiStrat s = (WuWeiStrat)in[0];
+    size_t orig = (size_t)in[1] | ((size_t)in[2]<<8) | ((size_t)in[3]<<16) | ((size_t)in[4]<<24);
+    if (orig > cap) return 0;
+    const uint8_t *pl = in + 5; size_t pn = n - 5;
+    uint8_t *t1 = (uint8_t*)malloc(orig * 4 + 64);
+    uint8_t *t2 = (uint8_t*)malloc(orig * 4 + 64);
+    if (!t1 || !t2) { free(t1); free(t2); return 0; }
+    size_t r = 0, t;
+    switch (s) {
+    case WW_NONACTION:
+        if (pn <= cap) { memcpy(out, pl, pn); r = pn; }
+        break;
+    case WW_GENTLE_STREAM:
+    case WW_BALANCED_PATH:
+        t = ww_rle_dec(pl, pn, t1, orig*4+64);
+        r = ww_delta_dec(t1, t, out);
+        break;
+    case WW_FLOWING_RIVER:
+        t = ww_rle_dec(pl, pn, t1, orig*4+64);
+        t = ww_delta_dec(t1, t, t2);
+        t = ww_rle_dec(t2, t, t1, orig*4+64);
+        r = ww_delta_dec(t1, t, out);
+        break;
+    case WW_REPEATED_WAVES:
+        t = ww_rle_dec(pl, pn, t1, orig*4+64);
+        t = ww_delta_dec(t1, t, t2);
+        r = ww_rle_dec(t2, t, out, cap);
+        break;
+    }
+    free(t1); free(t2);
+    return r;
+}
+
+static void module_wuwei_codec(void) {
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [G] Wu-Wei Fold26 Codec  --  Lattice-Adaptive Compression    |\n"
+        "+================================================================+\n"
+        CR "\n");
+
+    /* Seed phi-CSPRNG from lattice jitter */
+    uint64_t jit[64]; uint64_t jseed = cx_jitter_harvest(jit);
+    PhiCSPRNG rng; phi_csprng_init(&rng, jseed);
+
+    /* Resonance hint in [0,1]: biases strategy entropy gate */
+    uint8_t hb[2]; phi_csprng_read(&rng, hb, 2);
+    float hint = (float)((uint32_t)hb[0] | ((uint32_t)hb[1] << 8)) / 65535.0f;
+    printf("  Lattice CSPRNG seeded  (jitter=0x%016llx)\n", (unsigned long long)jseed);
+    printf("  Resonance hint         : %.4f  (lowers non-action threshold by %.3f bits)\n\n",
+           hint, hint * 0.5f);
+
+#define WW_N 2048
+    uint8_t *d_lat = (uint8_t*)malloc(WW_N);
+    uint8_t *d_seq = (uint8_t*)malloc(WW_N);
+    uint8_t *d_rep = (uint8_t*)malloc(WW_N);
+    uint8_t *d_rnd = (uint8_t*)malloc(WW_N);
+    uint8_t *buf_c = (uint8_t*)malloc(WW_N * 4 + 64);
+    uint8_t *buf_r = (uint8_t*)malloc(WW_N * 2);
+
+    if (!d_lat || !d_seq || !d_rep || !d_rnd || !buf_c || !buf_r) {
+        printf("  " RED "[ERR] malloc failed\n" CR);
+        free(d_lat); free(d_seq); free(d_rep); free(d_rnd); free(buf_c); free(buf_r);
+        return;
+    }
+
+    /* Corpus 1: phi-lattice double bytes (smooth, structured, correlated) */
+    {
+        const uint8_t *lb = (const uint8_t*)lattice;
+        size_t lbytes = (size_t)lattice_N * sizeof(double);
+        for (int i = 0; i < WW_N; i++) d_lat[i] = lb[i % lbytes];
+    }
+    /* Corpus 2: sequential 0..255 repeating (temporally correlated) */
+    for (int i = 0; i < WW_N; i++) d_seq[i] = (uint8_t)(i & 0xff);
+    /* Corpus 3: repeating 8-byte block pattern (highly repetitive) */
+    for (int i = 0; i < WW_N; i++) d_rep[i] = (uint8_t)((i / 8) & 0x1f);
+    /* Corpus 4: phi-CSPRNG output (high entropy -- wu-wei: do not force) */
+    phi_csprng_read(&rng, d_rnd, WW_N);
+
+    static const char * const CNAMES[4] = {
+        "Lattice snapshot (smooth DBL)",
+        "Sequential 0..255 (correlated)",
+        "Repeated pattern  (repetitive)",
+        "CSPRNG output     (high-entropy)"
+    };
+    uint8_t *corpus[4] = { d_lat, d_seq, d_rep, d_rnd };
+
+    printf("  %-33s  %6s  %5s  %5s  %-33s  %6s  %s\n",
+           "Corpus", "H-bits", "Corr", "Rep", "Strategy", "Ratio", "RT");
+    printf("  %s\n",
+           "-----------------------------------------------------------------------"
+           "-------------------");
+
+    for (int t = 0; t < 4; t++) {
+        uint8_t *d = corpus[t];
+        float ent = ww_entropy(d, WW_N);
+        float cor = ww_correlation(d, WW_N);
+        float rep = ww_repetition(d, WW_N);
+        WuWeiStrat strat = ww_select(ent, cor, rep, hint);
+        size_t csz = ww_compress(d, WW_N, buf_c, WW_N*4+64, strat);
+        size_t dsz = 0; int ok = 0;
+        if (csz) {
+            dsz = ww_decompress(buf_c, csz, buf_r, WW_N * 2);
+            ok  = (dsz == WW_N && memcmp(buf_r, d, WW_N) == 0);
+        }
+        float ratio = csz ? (float)WW_N / (float)csz : 0.0f;
+        printf("  %-33s  %6.2f  %5.3f  %5.3f  %-33s  %5.2fx  %s\n",
+               CNAMES[t], ent, cor, rep, WW_NAMES[strat], ratio,
+               ok ? GRN "[OK]" CR : RED "[FAIL]" CR);
+    }
+
+    printf("\n  " BOLD "Kernel codec role:" CR "\n");
+    printf("    Kernel image sections  -> wu-wei fold -> Noise_XX AEAD encrypt\n");
+    printf("    Entropy pool snapshots -> phi-CSPRNG state -> wu-wei fold -> sealed\n");
+    printf("    Noise_XX payloads      -> ww_compress -> AES-256-GCM (module [F])\n");
+    printf("    Log streams            -> streaming fold26 64KB chunks, O(1) mem\n\n");
+
+    printf("  " BOLD "Lattice-first wu-wei:" CR "\n");
+    printf("    phi[4096] resonance hint biases the entropy gate threshold\n");
+    printf("    Data nature guides transform; lattice biases the decision.\n");
+    printf("    Non-action when entropy is maximal -- wu-wei: do not force.\n\n");
+
+    free(d_lat); free(d_seq); free(d_rep); free(d_rnd); free(buf_c); free(buf_r);
+#undef WW_N
 }
 
 /* ══════════════════════════ MAIN ════════════════════════════════════════════ */
@@ -4702,6 +4999,7 @@ static void print_menu(void) {
     printf("  " YEL "[D]" CR " Phi-Native Engine    AVX2+FMA3 phi-resonance compute peak\n");
     printf("  " YEL "[E]" CR " Crypto Layer         SHA-256/HMAC/HKDF-Expand lattice CSPRNG\n");
     printf("  " YEL "[F]" CR " Full Crypto Stack     AES-256-GCM + X25519 + Noise_XX (lattice-keyed)\n");
+    printf("  " YEL "[G]" CR " Wu-Wei Codec          fold26 lattice-adaptive compression\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -4730,6 +5028,7 @@ int main(int argc, char *argv[]) {
         case 'd': module_quantum_throughput();   break;
         case 'e': module_crypto();                 break;
         case 'f': module_fullcrypto();              break;
+        case 'g': module_wuwei_codec();              break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -4762,6 +5061,7 @@ int main(int argc, char *argv[]) {
         case 'd': module_quantum_throughput();  break;
         case 'e': module_crypto();               break;
         case 'f': module_fullcrypto();            break;
+        case 'g': module_wuwei_codec();            break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
