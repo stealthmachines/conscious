@@ -1,19 +1,40 @@
-# Mersenne Prime Search Pipeline
+# conscious
+*by [zchg.org](https://zchg.org)*
 
-A 4-track GPU-accelerated pipeline for finding Mersenne prime candidates and
-verifying them with Lucas-Lehmer, running on an **RTX 2060 12 GB** (CUDA sm_75).
+> A self-correcting spectral Markov dynamical sieve and Mersenne prime engine
+> running on GPU warps, CPU phi-lattice math, and dual interactive TUIs.
+
+GPU target: **RTX 2060 12 GB** (CUDA sm_75).  Folder: `primes/`.
 
 ## What Is It?
 
-This is an end-to-end system in beta for eventually hunting the next world-record Mersenne prime.
-It combines two original mathematical ideas — a **phi-lattice resonance scoring
-function** and the **HDGL wu-wei data-flow model** — with a hand-optimised,
-exact-integer Lucas-Lehmer GPU verifier.
+**conscious** is an end-to-end prime-resonance system combining:
+- A **phi-lattice scoring function** and **HDGL wu-wei data-flow model**
+- A hand-optimised exact-integer Lucas-Lehmer GPU verifier
+- A **Dual-Slot λₖ–σ Fused Engine** (FastSlot warp dynamics + Markov trit gate)
+- Two married TUIs: `prime_ui.exe` (prime math) + `chat_win.exe` (analog inference)
 
 A Mersenne prime has the form M_p = 2^p − 1.  There are only 52 known.  The
 largest (M_82589933, found 2018, ~24.8 million digits) took weeks on specialized
 hardware.  This pipeline fits entirely on a single consumer GPU and can verify
 exponents up to ~130 000 in minutes.
+
+### Dual-UI Architecture
+
+```
+conscious.exe  (GPU: λₖ–σ resonance field — fused Markov dynamical sieve)
+       ↑                              ↑
+prime_ui.exe                    chat_win.exe
+(Track E: prime math TUI)       (analog inference TUI)
+       ↑                              ↑
+ ll_mpi.exe (LL verifier)       bot.exe (HDGL-28 router)
+       ↑                              ↑
+Mersenne candidates          phi-lattice embeddings
+```
+
+`prime_ui` and `chat_win` are **married**: prime_ui produces ranked candidates;
+`conscious.exe` validates via GPU resonance; `chat_win` reasons over findings
+through the HDGL-28 analog inference router.
 
 ## What's Cool About It?
 
@@ -124,6 +145,11 @@ A self-contained menu-driven TUI (no external dependencies) covering all 13 libr
 functions: Prime Pipeline, Number Analyzer, Mersenne Explorer, Zeta Zeros viewer,
 and a microsecond-resolution Benchmark.  See [Track E](#track-e--prime-library-tui-prime_uiexe) below.
 
+**10. Dual-Slot λₖ–σ Fused Engine (`conscious_fused_engine.cu`) — self-correcting GPU resonance layer.**
+Single CUDA module collapsing fast dynamics, spectral analysis, Markov gating,
+and LL decision geometry into one kernel-launch domain.  The shared computational
+backend that bridges `prime_ui.exe` and `chat_win.exe`.  See [Track F](#track-f--dual-slot-λₖσ-fused-engine) below.
+
 ---
 
 ## Architecture
@@ -147,9 +173,11 @@ ll_mpi.exe <p>
 | C | ll_mpi.cu | Lucas-Lehmer verifier — exact integer, no DWT, no cuFFT |
 | D | prime_pipeline.c | phi-filter + D_n ranker + sieve |
 | E | prime_ui.c | Windows TUI — interactive prime library (5 modules) |
+| F | conscious_fused_engine.cu | Dual-Slot λₖ–σ Fused Engine — GPU resonance layer |
 | — | ll_analog.c | v30b Slot4096 APA + 8D Kuramoto oscillator (CPU, CUDA-free) |
 | — | hdgl_analog_v30.c | HDGL Analog Mainnet V3.0 — standalone Dₙ(r) lattice engine |
 | — | bench_prime_funcs.c | 13-function tri-compiler benchmark harness |
+| — | bot.c / chat_win.c | HDGL-28 analog inference server + TUI chat client |
 
 ---
 
@@ -548,6 +576,78 @@ all 13 prime functions inlined from `bench_prime_funcs.c`, `prime_pipeline.c`,
 ```
 
 **Usage:** `.\prime_ui.exe`  — single-key menu navigation; `Q` to quit.
+
+---
+
+## Track F — Dual-Slot λₖ–σ Fused Engine (`conscious_fused_engine.cu`)
+
+The shared GPU resonance layer that bridges `prime_ui.exe` and `chat_win.exe`.
+Self-correcting spectral Markov dynamical sieve running entirely on GPU warps —
+no host intervention between steps.
+
+### What Was Collapsed
+
+| System | Before | Now |
+|--------|--------|-----|
+| Fast dynamics | separate CPU/GPU loop | warp kernel (stage 1) |
+| Spectral analysis | post-process | in-kernel warp reduction (stage 2) |
+| Markov gating | matrix-based | numerically-stable softmax fused (stage 3) |
+| Consensus | shared-memory vote | `__ballot_sync` + `__popc` (stage 4) |
+| LL correction | host-driven | device-local every 16 steps (stage 5) |
+| Decision | external | embedded verdict rule (host, post-reduce) |
+
+### Kernel Stages
+
+```
+fused_lambda_sigma_kernel<<<grid, 256>>>:
+  1. FastSlot Euler step        f_re/im/phase ← Kuramoto-style oscillator
+  2. λₖ warp reduction          shuffle-reduce lk → λ̄_warp (5 stages, no smem)
+  3. Markov trit gate           logits {l−, l₀, l+} → softmax → curand sample
+  4. Warp majority-vote fix     ballot+popc: >16/32 lanes override minority
+  5. Slot4096 slow-sync         every 16 steps: radial error → fast-slot nudge
+  6. Block stats export         thread 0 writes BlockStats (phi+/0/−, γ, λ̄)
+
+reduce_cluster_metrics<<<...>>>:
+  BlockStats[B] → global atomicAdd → host φ+, φ0, φ−, γ̄
+```
+
+### Verdict Rule (prime resonance classifier)
+
+    φ+ > 0.35             → ACCEPT   (σ=+1 majority: lattice locked → prime signal)
+    φ− > 0.45             → REJECT   (σ=−1 majority: field scattered → composite)
+    R = 1.2·φ− + 0.8·γ − φ+ > 0.6 → REJECT
+    else                  → UNCERTAIN
+
+Mirrors `osc LOCKED + residue=0` from `ll_analog` but derived from warp-aggregate
+cluster geometry rather than sequential Kuramoto phase.
+
+### Data Structures
+
+| Struct | Size | Purpose |
+|--------|------|---------|
+| `Slot4096` | 16 B | High-fidelity anchor: `re, im, phase, Dn` |
+| `FastSlot`  | 16 B | Warp oscillator prediction manifold |
+| `DualState` | 48 B | Per-thread cell: Slot4096 + FastSlot + λₖ + σ + error |
+| `BlockStats`| 32 B | Per-block output: φ+/0/−, γ̄, λ̄ |
+
+256 threads × 48 bytes = 12 KB per block (fits L1 on sm_75).
+
+**Build:** `build_conscious.bat`  (requires nvcc + CUDA 12+, `-lcurand`, sm_75+)
+
+```bat
+.\build_conscious.bat
+.\build_conscious.bat --debug      # -G -lineinfo for cuda-gdb
+.\build_conscious.bat --selftest   # build + run selftest
+```
+
+**Usage:**
+```
+conscious.exe                        # N=8192, steps=1024
+conscious.exe --N 32768 --steps 512
+conscious.exe --quiet
+conscious.exe --selftest
+conscious.exe --seed DEADBEEF00001234
+```
 
 ---
 

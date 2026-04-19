@@ -66,7 +66,34 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+/* Windows compat: timespec is in <time.h> (MSVC ucrt); provide clock_gettime + nanosleep */
+#include <windows.h>
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+static int clock_gettime(int clk, struct timespec *ts) {
+    (void)clk;
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    long long ns = (long long)(cnt.QuadPart * 1000000000LL / freq.QuadPart);
+    ts->tv_sec  = (long)(ns / 1000000000LL);
+    ts->tv_nsec = (long)(ns % 1000000000LL);
+    return 0;
+}
+#endif
+#ifndef HAVE_NANOSLEEP
+static int nanosleep(const struct timespec *req, struct timespec *rem) {
+    (void)rem;
+    DWORD ms = (DWORD)((long long)req->tv_sec * 1000 + req->tv_nsec / 1000000);
+    Sleep(ms ? ms : 1);
+    return 0;
+}
+#define HAVE_NANOSLEEP 1
+#endif
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -297,10 +324,10 @@ int64_t get_rtc_ns(void) {
 void rtc_sleep_until(int64_t target_ns) {
     int64_t now = get_rtc_ns();
     if (target_ns <= now) return;
-    struct timespec req = {
-        .tv_sec  = (target_ns-now)/1000000000LL,
-        .tv_nsec = (target_ns-now)%1000000000LL
-    };
+    int64_t diff = target_ns - now;
+    struct timespec req;
+    req.tv_sec  = (long)(diff / 1000000000LL);
+    req.tv_nsec = (long)(diff % 1000000000LL);
     nanosleep(&req, NULL);
 }
 
