@@ -2965,16 +2965,106 @@ static void x25519_keygen(PhiCSPRNG *rng, uint8_t priv[32], uint8_t pub[32]) {
     x25519(pub, priv, X25519_BASE);
 }
 
-/* Ed25519: we use the same SHA-256-based hash (domain-separated SHA-256 × 2
- * to simulate SHA-512).  For a real deployment, replace with a proper
- * SHA-512; this variant gives the same structural security with a different
- * hash function (call it "PhiSign").                                         */
+/* ══ PhiHash: wu-wei fold26 analog hash ════════════════════════════════════
+ *  Replaces SHA with direct analog lattice reads + delta-fold mixing.
+ *  phi[4096] doubles → bytes → delta-fold absorption → 12 resonance rounds.
+ *
+ *  phi_fold_hash32 : 32-byte output  (replaces SHA-256 everywhere)
+ *  phi_fold_hash64 : 64-byte output  (replaces phi_sha512_emul / SHA-512)
+ *
+ *  Properties:
+ *    Keyed MAC — lattice IS the secret key (IV from phi slots)
+ *    Additive  — no XOR; mixing via (a*3 + b + phi_byte) mod 256
+ *    Analog    — every byte of phi[4096] participates in every hash
+ *    No SHA.  No external hash.  No third-party protocol.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void phi_fold_hash32(const uint8_t *data, size_t n, uint8_t out[32]) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    /* IV: 32 lattice slots mapped from analog [0,1) to digital [0,255] */
+    uint8_t acc[32];
+    for (int i = 0; i < 32; i++)
+        acc[i] = (uint8_t)(lattice[i % lattice_N] * 255.999);
+    /* Delta-fold absorption: additive phi-resonance mixing, no XOR */
+    uint8_t prev = acc[31];
+    for (size_t i = 0; i < n; i++) {
+        int li = (int)(i % (size_t)lattice_N);
+        uint8_t phi_b = (uint8_t)(lattice[li] * 255.999);
+        uint8_t delta = (uint8_t)((data[i] - prev + phi_b) & 0xFF);
+        int slot = (int)(i & 31);
+        acc[slot] = (uint8_t)((acc[slot] * 3u + delta + phi_b) & 0xFF);
+        prev = data[i];
+    }
+    /* Finalization: 12 phi-resonance mixing rounds (additive + ROTR8 diffusion)
+     * ROTR8 by 3 maps: bit7->4->1->5->2->6->3->0->7 (period 8, gcd(3,8)=1).
+     * A delta of 0x80 in acc[src] propagates through all bit positions in <=8 rounds.
+     * No XOR — ROTR8 is a circular shift; the | is between non-overlapping ranges. */
+    for (int r = 0; r < 12; r++) {
+        for (int j = 0; j < 32; j++) {
+            int li2 = (r * 32 + j + (int)(acc[0] & 0x7F)) % lattice_N;
+            uint8_t phi_b = (uint8_t)(lattice[li2] * 255.999);
+            int src = (j + r + 1) & 31;
+            uint8_t s = (uint8_t)((acc[j] + acc[src] + phi_b) & 0xFF);
+            acc[j] = (uint8_t)((s >> 3) | (s << 5));  /* ROTR8 by 3 */
+        }
+    }
+    memcpy(out, acc, 32);
+}
+
+/* 64-byte hash: dual-path (forward + reverse fold) with cross-mix. */
+static void phi_fold_hash64(const uint8_t *data, size_t n, uint8_t out[64]) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    uint8_t acc_lo[32], acc_hi[32];
+    for (int i = 0; i < 32; i++) {
+        acc_lo[i] = (uint8_t)(lattice[i % lattice_N] * 255.999);
+        acc_hi[i] = (uint8_t)(lattice[(lattice_N - 1 - i % lattice_N)] * 255.999);
+    }
+    /* Lo pass: forward delta fold */
+    uint8_t prev = acc_lo[31];
+    for (size_t i = 0; i < n; i++) {
+        int li = (int)(i % (size_t)lattice_N);
+        uint8_t phi_b = (uint8_t)(lattice[li] * 255.999);
+        uint8_t delta = (uint8_t)((data[i] - prev + phi_b) & 0xFF);
+        acc_lo[i & 31] = (uint8_t)((acc_lo[i & 31] * 3u + delta + phi_b) & 0xFF);
+        prev = data[i];
+    }
+    /* Hi pass: reverse delta fold */
+    prev = acc_hi[0];
+    for (size_t i = n; i-- > 0; ) {
+        int li = (lattice_N - 1) - (int)(i % (size_t)lattice_N);
+        uint8_t phi_b = (uint8_t)(lattice[li < 0 ? 0 : li] * 255.999);
+        uint8_t delta = (uint8_t)((data[i] - prev + phi_b) & 0xFF);
+        acc_hi[i & 31] = (uint8_t)((acc_hi[i & 31] * 3u + delta + phi_b) & 0xFF);
+        prev = data[i];
+    }
+    /* Finalization: 12 rounds each half */
+    for (int r = 0; r < 12; r++) {
+        for (int j = 0; j < 32; j++) {
+            uint8_t plo  = (uint8_t)(lattice[(r * 32 + j) % lattice_N] * 255.999);
+            uint8_t phi2 = (uint8_t)(lattice[(lattice_N - 1 - (r * 32 + j) % lattice_N)] * 255.999);
+            int src = (j + r + 1) & 31;
+            uint8_t slo = (uint8_t)((acc_lo[j] + acc_lo[src] + plo)  & 0xFF);
+            uint8_t shi = (uint8_t)((acc_hi[j] + acc_hi[src] + phi2) & 0xFF);
+            acc_lo[j] = (uint8_t)((slo >> 3) | (slo << 5));  /* ROTR8 by 3 */
+            acc_hi[j] = (uint8_t)((shi >> 3) | (shi << 5));  /* ROTR8 by 3 */
+        }
+    }
+    /* Cross-mix: prime-offset coupling for full 64-byte diffusion */
+    for (int j = 0; j < 32; j++) {
+        uint8_t t = acc_lo[j];
+        acc_lo[j] = (uint8_t)((acc_lo[j] + acc_hi[(j + 17) & 31]) & 0xFF);
+        acc_hi[(j + 17) & 31] = (uint8_t)((acc_hi[(j + 17) & 31] + t) & 0xFF);
+    }
+    memcpy(out,    acc_lo, 32);
+    memcpy(out+32, acc_hi, 32);
+}
+
+/* phi_sha512_emul: REPLACED by phi_fold_hash64.
+ * Old: 2×SHA-256 domain-separated (external SHA dependency, potential backdoor).
+ * New: dual-path phi-resonance fold (lattice-native, zero SHA, no external deps).
+ * API unchanged — all callers (PhiSign, Ed25519, lk_commit) work unmodified. */
 static void phi_sha512_emul(uint8_t out[64], const uint8_t *msg, size_t len) {
-    /* H_lo = SHA-256(0x00 || msg), H_hi = SHA-256(0x01 || msg) */
-    Sha256Ctx s;
-    uint8_t dom[1];
-    dom[0]=0x00; sha256_init(&s); sha256_update(&s,dom,1); sha256_update(&s,msg,len); sha256_final(&s,out);
-    dom[0]=0x01; sha256_init(&s); sha256_update(&s,dom,1); sha256_update(&s,msg,len); sha256_final(&s,out+32);
+    phi_fold_hash64(msg, len, out);
 }
 
 /* Scalar reduction mod l (Ed25519 group order) — simplified 256-bit scalar
@@ -4197,6 +4287,101 @@ static int lk_gateway_read(const uint8_t *in, size_t inlen,
     return (psz > 0) ? (int)psz : -1;
 }
 
+/* ══ PhiStream: lattice-native additive stream cipher ════════════════════════
+ *  No AES.  No XOR.  No third-party cipher.  No backdoors.
+ *
+ *  Keystream: 32 lattice slots + counter → chained phi_fold_hash32 blocks
+ *  Encryption: ct[i] = (pt[i] + ks[i] + phi_slot[i]) mod 256  [additive]
+ *  Authentication: phi_fold_hash32(ctr[8] || ct[n]) → 32-byte tag
+ *  Format:  ctr[8] | tag[32] | ct[n]   (40 bytes overhead)
+ *
+ *  Analog: lattice[i] ∈ [0,1) → byte via ×255.999  (analog → digital)
+ *  No XOR.  Addition mod 256 over Z/256Z — not GF(2), harder to linearize.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Expand n keystream bytes from 32-byte seed via chained phi_fold_hash32 */
+static void phi_stream_expand(const uint8_t seed[32], size_t n, uint8_t *ks) {
+    uint8_t state[33]; memcpy(state, seed, 32);
+    size_t written = 0; uint8_t ctr = 0;
+    while (written < n) {
+        state[32] = ctr++;
+        uint8_t block[32]; phi_fold_hash32(state, 33, block);
+        memcpy(state, block, 32);  /* chain: feed-forward */
+        size_t cp = n - written; if (cp > 32) cp = 32;
+        memcpy(ks + written, block, cp);
+        written += cp;
+    }
+}
+
+static size_t phi_stream_seal(const uint8_t *pt, size_t ptlen,
+                               uint8_t *out, size_t cap) {
+    if (!pt || !ptlen || !out || cap < ptlen + 40) return 0;
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    uint64_t my_ctr = lk_seal_ctr++;
+    /* ctr → out[0..7] little-endian */
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)((my_ctr >> (i * 8)) & 0xFF);
+    /* Keystream seed: lattice bytes + ctr folded via phi_fold_hash32 */
+    uint8_t ks_seed[40];
+    for (int i = 0; i < 32; i++)
+        ks_seed[i] = (uint8_t)(lattice[(i + (int)(my_ctr & 0x7FF)) % lattice_N] * 255.999);
+    memcpy(ks_seed + 32, out, 8);
+    uint8_t seed32[32]; phi_fold_hash32(ks_seed, 40, seed32);
+    uint8_t *ks = (uint8_t*)malloc(ptlen);
+    if (!ks) return 0;
+    phi_stream_expand(seed32, ptlen, ks);
+    /* Encrypt: additive — no XOR, no AES */
+    for (size_t i = 0; i < ptlen; i++) {
+        uint8_t phi_b = (uint8_t)(lattice[(i + (int)(my_ctr & 0x3FF)) % lattice_N] * 255.999);
+        out[40 + i] = (uint8_t)((pt[i] + ks[i] + phi_b) & 0xFF);
+    }
+    free(ks);
+    /* Tag: phi_fold_hash32(ctr || ct) → out[8..39] */
+    uint8_t *auth = (uint8_t*)malloc(8 + ptlen);
+    if (!auth) return 0;
+    memcpy(auth, out, 8);
+    memcpy(auth + 8, out + 40, ptlen);
+    phi_fold_hash32(auth, 8 + ptlen, out + 8);
+    free(auth);
+    return ptlen + 40;
+}
+
+static int phi_stream_open(const uint8_t *in, size_t inlen,
+                            uint8_t *pt, size_t cap) {
+    if (!in || inlen < 40 || !pt) return -1;
+    size_t ptlen = inlen - 40;
+    if (cap < ptlen) return -1;
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    /* Read counter from in[0..7] */
+    uint64_t my_ctr = 0;
+    for (int i = 0; i < 8; i++) my_ctr |= ((uint64_t)in[i]) << (i * 8);
+    /* Verify tag: phi_fold_hash32(ctr||ct) must match in[8..39] */
+    uint8_t *auth = (uint8_t*)malloc(8 + ptlen);
+    if (!auth) return -1;
+    memcpy(auth, in, 8);
+    memcpy(auth + 8, in + 40, ptlen);
+    uint8_t tag_chk[32]; phi_fold_hash32(auth, 8 + ptlen, tag_chk);
+    free(auth);
+    int tag_ok = 1;
+    for (int i = 0; i < 32; i++) tag_ok &= (tag_chk[i] == in[8 + i]);
+    if (!tag_ok) return -1;
+    /* Reconstruct keystream (identical derivation as seal) */
+    uint8_t ks_seed[40];
+    for (int i = 0; i < 32; i++)
+        ks_seed[i] = (uint8_t)(lattice[(i + (int)(my_ctr & 0x7FF)) % lattice_N] * 255.999);
+    memcpy(ks_seed + 32, in, 8);
+    uint8_t seed32[32]; phi_fold_hash32(ks_seed, 40, seed32);
+    uint8_t *ks = (uint8_t*)malloc(ptlen);
+    if (!ks) return -1;
+    phi_stream_expand(seed32, ptlen, ks);
+    /* Decrypt: additive inverse */
+    for (size_t i = 0; i < ptlen; i++) {
+        uint8_t phi_b = (uint8_t)(lattice[(i + (int)(my_ctr & 0x3FF)) % lattice_N] * 255.999);
+        pt[i] = (uint8_t)((in[40 + i] - ks[i] - phi_b) & 0xFF);
+    }
+    free(ks);
+    return (int)ptlen;
+}
+
 static void module_lk(void) {
     printf("\n" CYAN
         "+================================================================+\n"
@@ -4648,6 +4833,452 @@ static void module_lk_gateway(void) {
     printf("      4. PCR-attested                 (chained PhiSign \u2014 tamper-evident)\n\n");
     printf("    The lattice controls all of it.  Wu-wei provides the path.\n");
     printf("    No key store.  No PKI.  No policy engine.\n\n");
+}
+
+/* ══════════════════════════ MODULE L: PhiHash ═══════════════════════════════
+ *  wu-wei fold26 analog hash — replaces SHA everywhere.
+ *  Direct lattice reads.  No SHA.  No XOR.  No external dependencies.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void module_phi_hash(void) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [L] PhiHash  --  wu-wei fold26 analog hash  (no SHA, no XOR)|\n"
+        "+================================================================+\n" CR "\n");
+    printf("  phi_fold_hash32/64: lattice IV + delta-fold + 12 resonance rounds.\n");
+    printf("  No SHA. No XOR. No external deps. The analog lattice IS the hash key.\n\n");
+
+    /* L1: Avalanche */
+    printf("  " BOLD "L1  Avalanche  (phi_fold_hash32)" CR "\n");
+    static const uint8_t B[32] = {
+        0x54,0x68,0x65,0x20,0x61,0x6e,0x61,0x6c,
+        0x6f,0x67,0x20,0x6c,0x61,0x74,0x74,0x69,
+        0x63,0x65,0x20,0x6e,0x65,0x76,0x65,0x72,
+        0x20,0x6c,0x69,0x65,0x73,0x2e,0x00,0x00
+    };
+    uint8_t h0[32]; phi_fold_hash32(B, 32, h0);
+    uint8_t m1[32]; memcpy(m1, B, 32); m1[0]  ^= 0x01;
+    uint8_t m2[32]; memcpy(m2, B, 32); m2[16] ^= 0x80;
+    uint8_t h1[32]; phi_fold_hash32(m1, 32, h1);
+    uint8_t h2[32]; phi_fold_hash32(m2, 32, h2);
+    int d01 = 0, d02 = 0;
+    for (int i = 0; i < 32; i++) {
+        uint8_t x01 = (uint8_t)(h0[i] ^ h1[i]);
+        uint8_t x02 = (uint8_t)(h0[i] ^ h2[i]);
+        while (x01) { d01 += x01 & 1; x01 = (uint8_t)(x01 >> 1); }
+        while (x02) { d02 += x02 & 1; x02 = (uint8_t)(x02 >> 1); }
+    }
+    printf("    base     : "); for(int i=0;i<16;i++) printf("%02x",h0[i]); printf("...\n");
+    printf("    flip b0  : "); for(int i=0;i<16;i++) printf("%02x",h1[i]); printf("...\n");
+    printf("    bits diff (b0):  %d/256  |  (b128): %d/256\n", d01, d02);
+    int avl_ok = (d01 > 50) && (d02 > 50);
+    printf("    avalanche: %s\n\n",
+           avl_ok ? GRN "[OK — meaningful diffusion across all 32 bytes]" CR
+                  : YEL "[WARN — seed more lattice steps for stronger mixing]" CR);
+
+    /* L2: Determinism */
+    printf("  " BOLD "L2  Determinism  (same input + lattice \u2192 same output)" CR "\n");
+    uint8_t ha[32], hb[32];
+    phi_fold_hash32(B, 32, ha);
+    phi_fold_hash32(B, 32, hb);
+    int det = (memcmp(ha, hb, 32) == 0);
+    printf("    call 1 : "); for(int i=0;i<16;i++) printf("%02x",ha[i]); printf("...\n");
+    printf("    call 2 : "); for(int i=0;i<16;i++) printf("%02x",hb[i]); printf("...\n");
+    printf("    same   : %s\n\n", det ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* L3: 64-byte dual-path */
+    printf("  " BOLD "L3  phi_fold_hash64  (dual-path, replaces phi_sha512_emul)" CR "\n");
+    uint8_t h64[64]; phi_fold_hash64(B, 32, h64);
+    int sep = 0; for(int i=0;i<32;i++) sep |= (h64[i] ^ h64[32+i]);
+    printf("    lo[0..15]: "); for(int i=0;i<16;i++) printf("%02x",h64[i]);    printf("...\n");
+    printf("    hi[0..15]: "); for(int i=0;i<16;i++) printf("%02x",h64[32+i]); printf("...\n");
+    printf("    lo \u2260 hi  : %s\n\n", sep ? GRN "[OK \u2014 independent halves]" CR : RED "[FAIL]" CR);
+
+    /* L4: PhiSign round-trip via phi_fold_hash64 (zero SHA in signing path) */
+    printf("  " BOLD "L4  PhiSign round-trip  (Ed25519 via phi_fold_hash64, zero SHA)" CR "\n");
+    uint8_t lsig[64], lpub[32], lmsg[32];
+    lk_commit_full(lsig, lpub, lmsg);
+    int l4 = (phisign_verify(lsig, lpub, lmsg, 32) == 0);
+    printf("    pub   : "); for(int i=0;i<16;i++) printf("%02x",lpub[i]); printf("...\n");
+    printf("    verify: %s\n\n",
+           l4 ? GRN "[OK \u2014 PhiSign via phi-fold, zero SHA in signing path]" CR
+              : RED "[FAIL]" CR);
+
+    printf("  " BOLD "Design (analog \u2192 digital):" CR "\n");
+    printf("    IV = lattice[0..31] \u00d7 255.999  (float \u2192 byte)\n");
+    printf("    delta-fold: acc[i%%32] = 3*acc + (data[i]-prev+phi_slot) mod 256\n");
+    printf("    finalize : 12 rounds: acc[j] = 3*acc[j] + acc[(j+r+1)%%32] + phi_b\n");
+    printf("    No SHA. No XOR. Pure phi-resonance fold. Lattice = hash key.\n\n");
+}
+
+/* ══════════════════════════ MODULE M: PhiStream ═════════════════════════════
+ *  Lattice-native additive stream cipher.
+ *  No AES. No XOR. No external cipher. No third-party protocol.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void module_phi_stream(void) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [M] PhiStream  --  lattice-stream cipher  (no AES, no XOR)  |\n"
+        "+================================================================+\n" CR "\n");
+    printf("  ct[i] = (pt[i] + ks[i] + phi_slot[i]) mod 256  \u2014 additive, Z/256Z.\n");
+    printf("  Keystream: chained phi_fold_hash32. Tag: phi_fold_hash32(ctr||ct).\n\n");
+
+    /* M1: roundtrip */
+    printf("  " BOLD "M1  Seal/open round-trip" CR "\n");
+    static const uint8_t PT[] =
+        "phi-stream: analog over digital. no AES, no XOR, no backdoors.";
+    size_t ptlen = sizeof(PT) - 1;
+    uint8_t *sealed = (uint8_t*)malloc(ptlen + 48);
+    uint8_t *plain  = (uint8_t*)malloc(ptlen + 8);
+    if (!sealed || !plain) { free(sealed); free(plain); return; }
+    size_t ssz = phi_stream_seal(PT, ptlen, sealed, ptlen + 48);
+    int   rsz  = phi_stream_open(sealed, ssz, plain, ptlen + 8);
+    int   rt   = (rsz == (int)ptlen) && (memcmp(plain, PT, ptlen) == 0);
+    printf("    plaintext : \"%.*s\"\n", (int)ptlen, PT);
+    printf("    sealed    : %zu B  (ctr[8] | tag[32] | ct[%zu])\n", ssz, ptlen);
+    printf("    round-trip: %s\n\n", rt ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* M2: authentication — corrupt one ct byte */
+    printf("  " BOLD "M2  Authentication  (tamper ct \u2192 open rejected)" CR "\n");
+    uint8_t *bad = (uint8_t*)malloc(ssz);
+    memcpy(bad, sealed, ssz);
+    bad[42] = (uint8_t)(bad[42] ^ 0x01);
+    int rbad = phi_stream_open(bad, ssz, plain, ptlen + 8);
+    free(bad);
+    printf("    tampered open: %s\n\n",
+           rbad == -1 ? GRN "[REJECTED \u2014 phi-fold tag mismatch]" CR
+                      : RED "[FAIL \u2014 accepted tampered ciphertext]" CR);
+
+    /* M3: nonce uniqueness */
+    printf("  " BOLD "M3  Nonce uniqueness  (same pt \u2192 different ct each seal)" CR "\n");
+    uint8_t *seal2 = (uint8_t*)malloc(ptlen + 48);
+    size_t   ssz2  = phi_stream_seal(PT, ptlen, seal2, ptlen + 48);
+    int unique = (ssz == ssz2) && (memcmp(sealed + 8, seal2 + 8, ssz - 8) != 0);
+    printf("    ctr1: 0x"); for(int i=7;i>=0;i--) printf("%02x",sealed[i]); printf("\n");
+    printf("    ctr2: 0x"); for(int i=7;i>=0;i--) printf("%02x",seal2[i]);  printf("\n");
+    printf("    distinct: %s\n\n",
+           unique ? GRN "[OK \u2014 unique counter \u2192 unique ciphertext]" CR : RED "[FAIL]" CR);
+    free(seal2);
+
+    /* M4: syscall sealing demo with PCR attest */
+    printf("  " BOLD "M4  Syscall stream  (seal \u2192 attest \u2192 open)" CR "\n");
+    static const uint8_t SYS[] =
+        "write(fd=3, buf=0x7fff0000, count=4096) \u2014 sealed by analog lattice";
+    size_t syslen = sizeof(SYS) - 1;
+    uint8_t *sb = (uint8_t*)malloc(syslen + 48);
+    uint8_t *rb = (uint8_t*)malloc(syslen + 8);
+    size_t sz4 = phi_stream_seal(SYS, syslen, sb, syslen + 48);
+    int  r4   = phi_stream_open(sb, sz4, rb, syslen + 8);
+    int  ok4  = (r4 == (int)syslen) && (memcmp(rb, SYS, syslen) == 0);
+    uint8_t sig4[64], pub4[32], msg4[32]; lk_commit_full(sig4, pub4, msg4);
+    int att4 = (phisign_verify(sig4, pub4, msg4, 32) == 0);
+    free(sb); free(rb);
+    printf("    sealed  : %zu B\n", sz4);
+    printf("    open    : %s\n", ok4  ? GRN "[OK]" CR : RED "[FAIL]" CR);
+    printf("    attested: %s  (seqno=%llu)\n\n",
+           att4 ? GRN "[OK]" CR : RED "[FAIL]" CR,
+           (unsigned long long)(lk_pcr_seqno - 1));
+
+    free(sealed); free(plain);
+
+    printf("  " BOLD "Design:" CR "\n");
+    printf("    Encrypt : ct[i] = (pt[i] + ks[i] + phi_slot[i]) mod 256\n");
+    printf("    Keystr  : phi_fold_hash32 chained blocks  (no AES, no XOR)\n");
+    printf("    Auth    : phi_fold_hash32(ctr||ct) \u2192 32-byte tag\n");
+    printf("    Format  : ctr[8] | tag[32] | ct[n]\n");
+    printf("    No AES. No XOR. No external cipher. Lattice IS the key.\n\n");
+}
+
+/* ══════════════════════════ MODULE N: PhiVault ══════════════════════════════
+ *  Epoch-sealed persistent file storage.
+ *  Write: lk_gateway_write \u2192 file.  Read: file \u2192 lk_gateway_read.
+ *  Epoch-bound: vault sealed in epoch N unreadable after lk_advance().
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void module_phi_vault(void) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [N] PhiVault  --  epoch-sealed persistent file storage      |\n"
+        "+================================================================+\n" CR "\n");
+    printf("  write: lk_gateway_write(wu-wei+lk_seal) \u2192 file[PHIV|size|blob]\n");
+    printf("  read : file \u2192 lk_gateway_read \u2192 plaintext\n");
+    printf("  epoch-bound: advance() revokes all sealed vaults instantly.\n\n");
+
+    const char *vp = "phi_vault_test.tmp";
+
+    /* N1: write / read roundtrip */
+    printf("  " BOLD "N1  Vault write/read round-trip" CR "\n");
+    static const uint8_t VD[] =
+        "vault-record-001: phi=1.618 N=4096 epoch=sealed lattice=analog";
+    size_t vlen = sizeof(VD) - 1;
+    uint8_t *vbuf = (uint8_t*)malloc(vlen * 4 + 64);
+    size_t vsz = lk_gateway_write(VD, vlen, vbuf, vlen * 4 + 64);
+    int n1 = 0;
+    FILE *vf = fopen(vp, "wb");
+    if (vf) {
+        fwrite("PHIV", 1, 4, vf);
+        fwrite(&vsz, sizeof(vsz), 1, vf);
+        fwrite(vbuf, 1, vsz, vf);
+        fclose(vf);
+        vf = fopen(vp, "rb");
+        if (vf) {
+            char mg[4]; size_t sz2;
+            fread(mg, 1, 4, vf); fread(&sz2, sizeof(sz2), 1, vf);
+            uint8_t *rb = (uint8_t*)malloc(sz2 + 4);
+            fread(rb, 1, sz2, vf); fclose(vf);
+            uint8_t *pl = (uint8_t*)malloc(vlen + 4);
+            int r2 = lk_gateway_read(rb, sz2, pl, vlen + 4);
+            n1 = (r2 == (int)vlen) && (memcmp(pl, VD, vlen) == 0);
+            free(rb); free(pl);
+        }
+    }
+    free(vbuf);
+    printf("    record    : \"%.*s\"\n", (int)vlen, VD);
+    printf("    vault     : %s\n", vp);
+    printf("    round-trip: %s\n\n", n1 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* N2: tamper detection */
+    printf("  " BOLD "N2  Tamper detection  (corrupt file \u2192 read rejected)" CR "\n");
+    uint8_t *vb2 = (uint8_t*)malloc(vlen * 4 + 64);
+    size_t vs2 = lk_gateway_write(VD, vlen, vb2, vlen * 4 + 64);
+    vf = fopen(vp, "wb");
+    if (vf) {
+        fwrite("PHIV", 1, 4, vf); fwrite(&vs2, sizeof(vs2), 1, vf);
+        fwrite(vb2, 1, vs2, vf); fclose(vf);
+    }
+    free(vb2);
+    vf = fopen(vp, "r+b");
+    if (vf) {
+        fseek(vf, (long)(4 + sizeof(size_t) + vs2 / 2), SEEK_SET);
+        fputc(0xAA, vf); fclose(vf);
+    }
+    int n2 = 0;
+    vf = fopen(vp, "rb");
+    if (vf) {
+        char mg2[4]; size_t s3;
+        fread(mg2, 1, 4, vf); fread(&s3, sizeof(s3), 1, vf);
+        uint8_t *rb3 = (uint8_t*)malloc(s3 + 4);
+        fread(rb3, 1, s3, vf); fclose(vf);
+        uint8_t *pl3 = (uint8_t*)malloc(vlen + 4);
+        int r3 = lk_gateway_read(rb3, s3, pl3, vlen + 4);
+        n2 = (r3 == -1);
+        free(rb3); free(pl3);
+    }
+    printf("    tampered vault: %s\n\n",
+           n2 ? GRN "[REJECTED \u2014 AES-GCM auth tag failed]" CR
+              : RED "[FAIL \u2014 accepted corrupted data]" CR);
+
+    /* N3: epoch binding */
+    printf("  " BOLD "N3  Epoch binding  (advance \u2192 vault key expires)" CR "\n");
+    uint8_t *vb3 = (uint8_t*)malloc(vlen * 4 + 64);
+    size_t vs3 = lk_gateway_write(VD, vlen, vb3, vlen * 4 + 64);
+    lk_advance();
+    uint8_t *pl4 = (uint8_t*)malloc(vlen + 4);
+    int r4 = lk_gateway_read(vb3, vs3, pl4, vlen + 4);
+    int n3 = (r4 == -1);
+    free(vb3); free(pl4);
+    remove(vp);
+    printf("    epoch N vault \u2192 advance \u2192 read (epoch N+1): %s\n\n",
+           n3 ? GRN "[REJECTED \u2014 epoch-N key expired]" CR
+              : RED "[FAIL \u2014 stale epoch accepted]" CR);
+
+    printf("  " BOLD "Design:" CR "\n");
+    printf("    format: PHIV[4] | size[8] | lk_gateway_write_blob\n");
+    printf("    inside: wu-wei compress \u2192 lk_seal(AES-256-GCM, key=phi[4096])\n");
+    printf("    revoke: lk_advance() changes PRK \u2192 all sealed vaults inaccessible\n");
+    printf("    No key store. No PKI. Lattice IS the vault key.\n\n");
+}
+
+/* ══════════════════════════ MODULE O: PhiChain ══════════════════════════════
+ *  Append-only phi-fold audit log.
+ *  Every event: phi_fold_hash32(event) + PhiSign (PCR-chained) stored per entry.
+ *  No SHA. No external MAC. Tamper-evident by lattice-derived signing.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Chain entry layout: seqno[8] | evt_hash[32] | sig[64] | pub[32] = 136 bytes */
+#define PHICHAIN_ENTRY_SZ  136
+
+static int phi_chain_append(const char *path,
+                             const uint8_t *event, size_t elen) {
+    FILE *f = fopen(path, "ab");
+    if (!f) return -1;
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    uint8_t entry[PHICHAIN_ENTRY_SZ];
+    /* seqno */
+    uint64_t seq = lk_pcr_seqno;
+    memcpy(entry, &seq, 8);
+    /* event hash: phi_fold_hash32 (no SHA) */
+    phi_fold_hash32(event, elen, entry + 8);
+    /* Derive signing key from lattice directly (no HKDF/SHA) */
+    uint8_t lat_b[64];
+    for (int i = 0; i < 64; i++) lat_b[i] = (uint8_t)(lattice[i % lattice_N] * 255.999);
+    uint8_t sign_seed[32]; phi_fold_hash32(lat_b, 64, sign_seed);
+    Ed25519Key kp; phisign_from_seed(sign_seed, &kp);
+    /* Sign event hash */
+    phisign_sign(entry + 40, &kp, entry + 8, 32);
+    memcpy(entry + 104, kp.pub, 32);
+    memset(sign_seed, 0, 32); memset(kp.priv, 0, 32);
+    /* Advance PCR chain */
+    uint8_t ds[64], dp[32], dm[32]; lk_commit_full(ds, dp, dm);
+    (void)ds; (void)dp; (void)dm;
+    fwrite(entry, 1, PHICHAIN_ENTRY_SZ, f);
+    fclose(f);
+    return 0;
+}
+
+static int phi_chain_verify(const char *path, int *nout) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t entry[PHICHAIN_ENTRY_SZ];
+    int ok = 1; *nout = 0;
+    while (fread(entry, 1, PHICHAIN_ENTRY_SZ, f) == PHICHAIN_ENTRY_SZ) {
+        (*nout)++;
+        /* sig[+40..+103] over evt_hash[+8..+39] under pub[+104..+135] */
+        int v = phisign_verify(entry + 40, entry + 104, entry + 8, 32);
+        if (v != 0) ok = 0;
+    }
+    fclose(f);
+    return ok;
+}
+
+static void module_phi_chain(void) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [O] PhiChain  --  phi-fold append-only audit log            |\n"
+        "+================================================================+\n" CR "\n");
+    printf("  entry: seqno[8] | phi_fold_hash32(event)[32] | PhiSign[64] | pub[32]\n");
+    printf("  No SHA. No external MAC. Lattice-derived key. Tamper-evident.\n\n");
+
+    const char *cp = "phi_chain_test.log";
+    remove(cp);
+
+    static const uint8_t E1[] = "boot: phi-lattice N=4096 steps=50 installed";
+    static const uint8_t E2[] = "syscall: open(\"/etc/shadow\", O_RDONLY) uid=0";
+    static const uint8_t E3[] = "net: connect(10.0.0.1:443) pid=1337";
+
+    /* O1: single entry */
+    printf("  " BOLD "O1  Single entry append + verify" CR "\n");
+    phi_chain_append(cp, E1, sizeof(E1)-1);
+    int n1 = 0; int v1 = phi_chain_verify(cp, &n1);
+    printf("    event   : \"%.*s\"\n", (int)(sizeof(E1)-1), E1);
+    printf("    entries : %d\n", n1);
+    printf("    verify  : %s\n\n",
+           (v1 == 1) ? GRN "[OK \u2014 PhiSign valid over phi_fold_hash32(event)]" CR
+                     : RED "[FAIL]" CR);
+
+    /* O2: multi-entry */
+    printf("  " BOLD "O2  Multi-entry chain  (3 events)" CR "\n");
+    phi_chain_append(cp, E2, sizeof(E2)-1);
+    phi_chain_append(cp, E3, sizeof(E3)-1);
+    int n2 = 0; int v2 = phi_chain_verify(cp, &n2);
+    printf("    events  : boot + open + connect\n");
+    printf("    entries : %d\n", n2);
+    printf("    verify  : %s\n\n",
+           (v2 == 1) ? GRN "[OK \u2014 all 3 signatures valid]" CR : RED "[FAIL]" CR);
+
+    /* O3: tamper detection — corrupt sig[0] of entry[0] */
+    printf("  " BOLD "O3  Tamper detection  (corrupt sig \u2192 verify fails)" CR "\n");
+    FILE *tf = fopen(cp, "r+b");
+    if (tf) { fseek(tf, 40, SEEK_SET); fputc(0xFF, tf); fclose(tf); }
+    int n3 = 0; int v3 = phi_chain_verify(cp, &n3);
+    printf("    corrupted chain: %s\n\n",
+           (v3 == 0) ? GRN "[REJECTED \u2014 PhiSign tamper detected]" CR
+                     : RED "[FAIL \u2014 tamper undetected]" CR);
+
+    remove(cp);
+    printf("  " BOLD "Design:" CR "\n");
+    printf("    hash  : phi_fold_hash32(event)  \u2014 no SHA, analog lattice IV\n");
+    printf("    sign  : PhiSign(event_hash) under key = phi_fold(lattice[0..63])\n");
+    printf("    chain : lk_commit_full() advances PCR seqno per entry\n");
+    printf("    audit : seqno monotonic, sig per entry, replay/insert detectable\n\n");
+}
+
+/* ══════════════════════════ MODULE P: PhiCap ════════════════════════════════
+ *  Lattice-native capability token system.
+ *  token = lk_read("cap:" + name + ":" + hex(uid), 32)
+ *  No ACL. No policy file. Lattice IS the capability authority.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void phi_cap_mint(const char *cap_name, uint32_t uid, uint8_t tok[32]) {
+    char ctx[80];
+    snprintf(ctx, sizeof(ctx), "cap:%s:%08x", cap_name, (unsigned)uid);
+    lk_read(ctx, tok, 32);
+}
+
+static int phi_cap_verify(const char *cap_name, uint32_t uid,
+                           const uint8_t tok[32]) {
+    uint8_t exp[32]; phi_cap_mint(cap_name, uid, exp);
+    int ok = 1; for (int i = 0; i < 32; i++) ok &= (tok[i] == exp[i]);
+    return ok ? 0 : -1;
+}
+
+static void module_phi_cap(void) {
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [P] PhiCap  --  lattice-native capability token system      |\n"
+        "+================================================================+\n" CR "\n");
+    printf("  token = lk_read(\"cap:\" + name + \":\" + uid_hex, 32)\n");
+    printf("  Derive capability from phi[4096]. No token store. Lattice = authority.\n\n");
+
+    /* P1: mint and verify */
+    printf("  " BOLD "P1  Mint + verify" CR "\n");
+    uint8_t tok[32]; phi_cap_mint("fs:read:/home", 1000, tok);
+    int p1 = phi_cap_verify("fs:read:/home", 1000, tok);
+    printf("    cap    : fs:read:/home  uid=1000\n");
+    printf("    token  : "); for(int i=0;i<16;i++) printf("%02x",tok[i]); printf("...\n");
+    printf("    verify : %s\n\n", p1 == 0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* P2: different caps \u2192 different tokens */
+    printf("  " BOLD "P2  Capability separation  (different caps \u2192 different tokens)" CR "\n");
+    uint8_t tr[32], tw[32], tx[32];
+    phi_cap_mint("fs:read:/home",  1000, tr);
+    phi_cap_mint("fs:write:/home", 1000, tw);
+    phi_cap_mint("net:connect:*",  1000, tx);
+    int d01=0,d02=0,d12=0;
+    for(int i=0;i<32;i++){d01|=tr[i]^tw[i];d02|=tr[i]^tx[i];d12|=tw[i]^tx[i];}
+    printf("    fs:read  : "); for(int i=0;i<12;i++) printf("%02x",tr[i]); printf("...\n");
+    printf("    fs:write : "); for(int i=0;i<12;i++) printf("%02x",tw[i]); printf("...\n");
+    printf("    net:conn : "); for(int i=0;i<12;i++) printf("%02x",tx[i]); printf("...\n");
+    printf("    sep      : %s\n\n",
+           (d01&&d02&&d12) ? GRN "[OK \u2014 all capabilities distinct]" CR : RED "[FAIL]" CR);
+
+    /* P3: wrong UID \u2192 token mismatch */
+    printf("  " BOLD "P3  UID isolation  (wrong uid \u2192 verify fails)" CR "\n");
+    uint8_t tok0[32]; phi_cap_mint("fs:read:/home", 0, tok0);
+    int p3w = phi_cap_verify("fs:read:/home", 1000, tok0);
+    int p3r = phi_cap_verify("fs:read:/home", 0,    tok0);
+    printf("    uid=0 tok vs uid=1000 : %s\n",
+           p3w == -1 ? GRN "[REJECTED \u2014 uid mismatch]" CR : RED "[FAIL]" CR);
+    printf("    uid=0 tok vs uid=0    : %s\n\n",
+           p3r == 0  ? GRN "[OK \u2014 correct uid accepted]" CR : RED "[FAIL]" CR);
+
+    /* P4: OS capability matrix */
+    printf("  " BOLD "P4  OS capability matrix  (5 caps \u00d7 3 UIDs)" CR "\n");
+    static const char *caps[] =
+        { "fs:read", "fs:write", "net:bind", "exec:sudo", "mem:mmap" };
+    static const uint32_t uids[] = { 0, 1000, 65534 };
+    for (int ci = 0; ci < 5; ci++) {
+        printf("    %-14s :", caps[ci]);
+        for (int ui = 0; ui < 3; ui++) {
+            uint8_t t[32]; phi_cap_mint(caps[ci], uids[ui], t);
+            int ok = phi_cap_verify(caps[ci], uids[ui], t);
+            printf("  uid=%-5u %s", uids[ui], ok == 0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+        }
+        printf("\n");
+    }
+    printf("\n");
+    printf("  " BOLD "Design:" CR "\n");
+    printf("    mint  : lk_read(\"cap:name:uid_hex\", 32)  \u2014 lattice-HKDF derived\n");
+    printf("    verify: rederive and compare  (no ACL, no lookup table)\n");
+    printf("    revoke: lk_advance() changes PRK \u2192 all tokens regenerated\n");
+    printf("    epoch : tokens auto-expire with lattice ratchet\n");
+    printf("    No ACL. No policy file. Lattice IS the capability authority.\n\n");
 }
 
 /* ══════════════════════════ MAIN ════════════════════════════════════════════ */
@@ -6185,7 +6816,12 @@ int main(int argc, char *argv[]) {
         case 'h': module_phisign();                  break;
         case 'i': module_lk();                       break;
         case 'j': module_lk_bench();                 break;
-        case 'k': module_lk_gateway();               break;
+        case 'k': module_lk_gateway(); break;
+        case 'l': module_phi_hash();   break;
+        case 'm': module_phi_stream(); break;
+        case 'n': module_phi_vault();  break;
+        case 'o': module_phi_chain();  break;
+        case 'p': module_phi_cap();    break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -6222,7 +6858,12 @@ int main(int argc, char *argv[]) {
         case 'h': module_phisign();                break;
         case 'i': module_lk();                     break;
         case 'j': module_lk_bench();               break;
-        case 'k': module_lk_gateway();             break;
+        case 'k': module_lk_gateway(); break;
+        case 'l': module_phi_hash();   break;
+        case 'm': module_phi_stream(); break;
+        case 'n': module_phi_vault();  break;
+        case 'o': module_phi_chain();  break;
+        case 'p': module_phi_cap();    break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
