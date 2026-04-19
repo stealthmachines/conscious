@@ -2836,9 +2836,9 @@ static void module_crystal_native(void) {
            " (crystal_phase_g = %.8f)\n\n", lattice_crystal_phase_g);
 }
 
-/* ══ MODULE D: Quantum Throughput ════════════════════════════════════════════
+/* ══ MODULE D: Phi-Native Engine ═════════════════════════════════════════════
  *
- *  AVX2 (4× double / 8× float) + FMA3 on Skylake i7-6700T.
+ *  Phi-resonance SIMD compute with hardware-entropy crystal seeding.
  *  This is the "fire" — phi-Weyl + resonance at hardware peak throughput.
  *
  *  What "quantum" means here:
@@ -2861,6 +2861,47 @@ static int cpu_has_avx2(void) {
 }
 static int cpu_has_fma(void) {
     int v[4] = {0}; __cpuid(v, 1); return (v[2] >> 12) & 1;
+}
+
+/* ── 2-wide XMM baseline (Bench 1): explicit __m128d intrinsics.            */
+/* On Windows, clang MSVC-ABI target ignores target("no-avx2") for pure-     */
+/* write loops — outer 10k-rep loop collapses to 1 call (all calls write     */
+/* identical values → DCE).  Explicit _mm_storeu_pd stores are ALWAYS        */
+/* preserved; __declspec(noinline) forces a real call on MSVC-target clang.  */
+__declspec(noinline)
+static void scalar_weyl_fill_ref(double *dst, int N, double phase) {
+    double pp = fmod(phase * PHI, 1.0);
+    __m128d phi2 = _mm_set1_pd(PHI);
+    __m128d pp2  = _mm_set1_pd(pp);
+    int i;
+    for (i = 0; i + 2 <= N; i += 2) {
+        __m128d idx = _mm_set_pd((double)(i + 1), (double)i);
+        __m128d v   = _mm_add_pd(_mm_mul_pd(idx, phi2), pp2); /* SSE2 mul+add */
+        __m128d fl  = _mm_floor_pd(v);                        /* SSE4.1 floor */
+        _mm_storeu_pd(dst + i, _mm_sub_pd(v, fl));            /* 2-wide store */
+    }
+    for (; i < N; i++) {
+        double v = (double)i * PHI + pp;
+        dst[i] = v - floor(v);
+    }
+}
+__declspec(noinline)
+static void scalar_resonance_ref(double *lat, int N) {
+    /* Explicit 2-wide XMM phi-resonance: _mm_mul_pd + _mm_add_pd + _mm_floor_pd */
+    /* __declspec(noinline) + explicit stores prevent auto-widening to YMM.       */
+    __m128d phi2 = _mm_set1_pd(PHI);
+    __m128d one2 = _mm_set1_pd(1.0);
+    int i;
+    for (i = 0; i + 2 <= N; i += 2) {
+        __m128d v  = _mm_loadu_pd(lat + i);
+        __m128d vp = _mm_mul_pd(phi2, _mm_add_pd(v, one2)); /* 2 mul+add = phi*(v+1) */
+        __m128d fl = _mm_floor_pd(vp);
+        _mm_storeu_pd(lat + i, _mm_sub_pd(vp, fl));
+    }
+    for (; i < N; i++) {
+        double v = PHI * (lat[i] + 1.0);
+        lat[i] = v - floor(v);
+    }
 }
 
 /* ── AVX2+FMA: phi-Weyl fill with crystal phase offset ────────────────── */
@@ -3097,7 +3138,7 @@ static void module_quantum_throughput(void) {
 
     printf("\n" CYAN
         "+--------------------------------------------------------------+\n"
-        "|  Quantum Throughput  --  AVX2 + FMA3 + Crystal-Native       |\n"
+        "|  Phi-Native Engine  --  AVX2 + FMA3 + Crystal-Jitter        |\n"
         "+--------------------------------------------------------------+\n"
         CR "\n");
 
@@ -3129,31 +3170,33 @@ static void module_quantum_throughput(void) {
     volatile float  facc = 0.0f;
     double jinit_us = 0.0;   /* filled by Benchmark 5 */
 
-    /* ── 1. Phi-Weyl fill: AVX2 vs scalar ── */
-    printf("  " BOLD "Benchmark 1: Phi-Weyl fill  (AVX2 FMA vs scalar)" CR "\n");
-    /* scalar baseline */
+    /* ── 1. Phi-Weyl fill: AVX2 vs SSE2 ── */
+    printf("  " BOLD "Benchmark 1: Phi-Weyl fill  (AVX2 4" "\xc3\x97" "f64 vs XMM 2" "\xc3\x97" "f64)" CR "\n");
+    /* SSE2-only baseline: target(no-avx2) forces 2-wide XMM, not 4-wide YMM */
     N_reps = 10000;
+    double cphase = (lattice_crystal_phase_g >= 0.0) ? lattice_crystal_phase_g : 0.0;
     t0 = now_s();
-    for (long r = 0; r < N_reps; r++)
-        for (int i = 0; i < LATTICE_MAX; i++) {
-            double v = (double)i * PHI;
-            bench_lat[i] = v - floor(v);
-        }
+    for (long r = 0; r < N_reps; r++) {
+        scalar_weyl_fill_ref(bench_lat, LATTICE_MAX, cphase);
+        __asm__ volatile ("" ::: "memory"); /* barrier: prevent call-hoist for pure-write fn */
+    }
     t1 = now_s();
     double sc_fill_ns = (t1 - t0) * 1e9 / (N_reps * LATTICE_MAX);
     for (int i = 0; i < LATTICE_MAX; i++) acc += bench_lat[i];
-    printf("    Scalar          : " YEL "%6.2f ns/slot" CR "\n", sc_fill_ns);
+    printf("    XMM  (2\u00d7f64)    : " YEL "%6.2f ns/slot" CR "\n", sc_fill_ns);
 
     /* AVX2 */
     t0 = now_s();
-    for (long r = 0; r < N_reps; r++) avx2_weyl_fill(bench_lat, LATTICE_MAX, 0.0);
+    for (long r = 0; r < N_reps; r++) {
+        avx2_weyl_fill(bench_lat, LATTICE_MAX, cphase);
+        __asm__ volatile ("" ::: "memory");
+    }
     t1 = now_s();
     double av_fill_ns = (t1 - t0) * 1e9 / (N_reps * LATTICE_MAX);
     for (int i = 0; i < LATTICE_MAX; i++) acc += bench_lat[i];
-    printf("    AVX2 FMA        : " GRN "%6.2f ns/slot" CR "   speedup: " BOLD "%.1fx\n" CR,
+    printf("    AVX2 (4\u00d7f64)    : " GRN "%6.2f ns/slot" CR "   speedup: " BOLD "%.1fx\n" CR,
            av_fill_ns, sc_fill_ns / av_fill_ns);
     /* with crystal phase */
-    double cphase = (lattice_crystal_phase_g >= 0.0) ? lattice_crystal_phase_g : 0.0;
     if (cphase > 0.0) {
         t0 = now_s();
         for (long r = 0; r < N_reps; r++) avx2_weyl_fill(bench_lat, LATTICE_MAX, cphase);
@@ -3164,35 +3207,37 @@ static void module_quantum_throughput(void) {
     }
     printf("\n");
 
-    /* ── 2. Resonance step: AVX2 FMA vs scalar ── */
-    printf("  " BOLD "Benchmark 2: Resonance step  (fmadd vs scalar mul)" CR "\n");
+    /* ── 2. Resonance step: AVX2 vs SSE2 ── */
+    printf("  " BOLD "Benchmark 2: Resonance step  (AVX2 fmadd vs SSE2 scalar mul)" CR "\n");
     /* prime the lattice with a real fill */
     avx2_weyl_fill(bench_lat, LATTICE_MAX, cphase);
 
     N_reps = 2000;
-    /* scalar */
+    /* SSE2-only baseline (no-avx2 target) */
     static double bench_sc[LATTICE_MAX];
     memcpy(bench_sc, bench_lat, LATTICE_MAX * sizeof(double));
     t0 = now_s();
-    for (long r = 0; r < N_reps; r++)
-        for (int i = 0; i < LATTICE_MAX; i++) {
-            double v = PHI * (bench_sc[i] + 1.0);
-            bench_sc[i] = v - floor(v);
-        }
+    for (long r = 0; r < N_reps; r++) {
+        scalar_resonance_ref(bench_sc, LATTICE_MAX);
+        __asm__ volatile ("" ::: "memory");
+    }
     t1 = now_s();
     double sc_res_ns = (t1 - t0) * 1e9 / (N_reps * (double)LATTICE_MAX);
-    /* how many real FLOPS: 1 mul + 1 add + 1 sub + 1 floor ≈ 4 per slot */
     double sc_gflops = 4.0 / sc_res_ns;
-    printf("    Scalar          : " YEL "%6.2f ns/slot" CR "   %.2f GFLOPS\n",
+    printf("    SSE2 (2\u00d7f64)    : " YEL "%6.2f ns/slot" CR "   %.2f GFLOPS\n",
            sc_res_ns, sc_gflops);
 
     /* AVX2 FMA: phi*v + phi = phi*(v+1) in ONE fmadd_pd instruction */
     t0 = now_s();
-    for (long r = 0; r < N_reps; r++) avx2_resonance_step_v(bench_lat, LATTICE_MAX);
+    for (long r = 0; r < N_reps; r++) {
+        avx2_resonance_step_v(bench_lat, LATTICE_MAX);
+        __asm__ volatile ("" ::: "memory");
+    }
+    t1 = now_s();
     t1 = now_s();
     double av_res_ns = (t1 - t0) * 1e9 / (N_reps * (double)LATTICE_MAX);
     double av_gflops = 4.0 / av_res_ns;  /* 4 FLOPS: FMA(2)+sub(1)+floor(1) */
-    printf("    AVX2 FMA        : " GRN "%6.2f ns/slot" CR "   %.2f GFLOPS  speedup: " BOLD "%.1fx\n" CR,
+    printf("    AVX2 (4×f64)    : " GRN "%6.2f ns/slot" CR "   %.2f GFLOPS  speedup: " BOLD "%.1fx\n" CR,
            av_res_ns, av_gflops, sc_res_ns / av_res_ns);
     printf("    FMA advantage   : phi*(v+1) = fmadd(v,phi,phi) — 1 instruction, 0 rounding error\n\n");
 
@@ -3385,10 +3430,10 @@ static void module_quantum_throughput(void) {
         printf("  " DIM "(Container not running — start with [6] Alpine Install)" CR "\n");
     }
 
-    printf("\n  " BOLD "Quantum advantage summary:" CR "\n");
-    printf("    Fill speedup    : %.1fx  (AVX2 vs scalar)\n", sc_fill_ns / av_fill_ns);
-    printf("    Resonance spdup : %.1fx  (AVX2 FMA vs scalar)\n", sc_res_ns / av_res_ns);
-    printf("    Analog/Digital  : %.0fx  (f32 sieve vs Miller-Rabin)\n\n", ratio);
+    printf("\n  " BOLD "Phi-Native Engine advantage summary:" CR "\n");
+    printf("    Fill speedup    : %.1fx  (AVX2 4\u00d7f64 vs XMM 2\u00d7f64)\n", sc_fill_ns / av_fill_ns);
+    printf("    Resonance spdup : %.1fx  (AVX2 FMA vs XMM 2\u00d7f64)\n", sc_res_ns / av_res_ns);
+    printf("    Analog/Digital  : %.0fx  (f32x8 sieve vs Miller-Rabin)\n\n", ratio);
 
     printf("  " DIM "acc=%.3f facc=%.3f  (prevents DCE)\n" CR "\n",
            (double)acc, (double)facc);
@@ -3769,7 +3814,7 @@ static void print_menu(void) {
     printf("  " YEL "[A]" CR " Process Scheduler    lattice-native per-process CPU/IO/cgroup\n");
     printf("  " YEL "[B]" CR " Lattice Benchmark    phi-native perf profile + niche analysis\n");
     printf("  " YEL "[C]" CR " Crystal-Native       quartz crystal -> lattice -> OS\n");
-    printf("  " YEL "[D]" CR " Quantum Throughput   AVX2+FMA3 fire on this hardware\n");
+    printf("  " YEL "[D]" CR " Phi-Native Engine    AVX2+FMA3 phi-resonance compute peak\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
