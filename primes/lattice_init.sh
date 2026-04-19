@@ -9,6 +9,47 @@ if [ -f '/lattice/entropy.bin' ]; then
   echo "[lattice] Entropy: $(wc -c < '/lattice/entropy.bin') bytes -> /dev/urandom"
 fi
 
+# -- 1b. Kernel sysctl: slots[23..30] -> /etc/sysctl.d/99-lattice.conf --
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-lattice.conf << 'EOSYSCTL'
+vm.swappiness = 0
+kernel.pid_max = 32768
+vm.dirty_ratio = 5
+net.core.somaxconn = 128
+kernel.sched_min_granularity_ns = 100000
+kernel.randomize_va_space = 0
+net.ipv4.tcp_rmem = 4096 4096 16777216
+net.ipv4.tcp_wmem = 4096 4096 16777216
+EOSYSCTL
+sysctl -w vm.swappiness=0 2>/dev/null              && echo '[lattice] vm.swappiness=0'
+sysctl -w kernel.pid_max=32768 2>/dev/null             && echo '[lattice] kernel.pid_max=32768'
+sysctl -w vm.dirty_ratio=5 2>/dev/null             && echo '[lattice] vm.dirty_ratio=5'
+sysctl -w net.core.somaxconn=128 2>/dev/null         && echo '[lattice] net.core.somaxconn=128'
+sysctl -w kernel.sched_min_granularity_ns=100000 2>/dev/null && echo '[lattice] sched_gran=100000ns'
+sysctl -w kernel.randomize_va_space=0 2>/dev/null  && echo '[lattice] aslr=0'
+sysctl -w net.ipv4.tcp_rmem='4096 4096 16777216' 2>/dev/null && echo '[lattice] tcp_rmem=4096'
+sysctl -w net.ipv4.tcp_wmem='4096 4096 16777216' 2>/dev/null && echo '[lattice] tcp_wmem=4096'
+
+# -- 1c. ramfs: /run/lattice -> in-memory lattice state for all processes --
+mkdir -p /run/lattice
+mount -t ramfs -o size=1m ramfs /run/lattice 2>/dev/null
+{
+echo 'LATTICE_SEED=0xfc3ed6b03ab19179'
+echo 'LATTICE_N=4096'
+echo 'LATTICE_STEPS=0'
+echo 'LATTICE_HOST=phi4096-00000000'
+echo 'LATTICE_SWAPPINESS=0'
+echo 'LATTICE_PID_MAX=32768'
+echo 'LATTICE_DIRTY_RATIO=5'
+echo 'LATTICE_SOMAXCONN=128'
+echo 'LATTICE_SCHED_GRAN=100000'
+echo 'LATTICE_ASLR=0'
+echo 'LATTICE_TCP_RMEM=4096'
+echo 'LATTICE_TCP_WMEM=4096'
+} > /run/lattice/state
+chmod 444 /run/lattice/state
+echo '[lattice] /run/lattice (ramfs) mounted — phi-field state live'
+
 # -- 2. Hostname (phi-fold of slots[0..3]) --
 hostname 'phi4096-00000000'
 echo 'phi4096-00000000' > /etc/hostname
@@ -57,6 +98,14 @@ export LATTICE_NOFILE=1024
 export LATTICE_UMASK=0002
 export LATTICE_HISTSIZE=500
 export LATTICE_TMOUT=300
+export LATTICE_SWAPPINESS=0
+export LATTICE_PID_MAX=32768
+export LATTICE_DIRTY_RATIO=5
+export LATTICE_SOMAXCONN=128
+export LATTICE_SCHED_GRAN=100000
+export LATTICE_ASLR=0
+export LATTICE_TCP_RMEM=4096
+export LATTICE_TCP_WMEM=4096
 umask 0002
 ulimit -n 1024 2>/dev/null
 export HISTSIZE=500
@@ -72,6 +121,8 @@ alias ls='ls --color=auto'
 alias ll='ls -la'
 alias lattice='cat /lattice/state.env'
 alias slots='ls /lattice/slots/ | head -32'
+alias kern='cat /run/lattice/state'
+alias sysctl-lattice='sysctl vm.swappiness kernel.pid_max vm.dirty_ratio net.core.somaxconn kernel.randomize_va_space 2>/dev/null'
 export HISTFILE=/home/slot4096/.bash_history
 EOBASHRC
 cp /home/slot4096/.bashrc /home/slot4096/.bash_profile
@@ -365,6 +416,7 @@ cat > /etc/motd << 'EOMOTD'
 | tz   : Etc/GMT+11                                       |
 | user : slot4096  uid: 1000   umask: 0002                     |
 | lim  : nofile=1024    hist=500    tmout=300 s               |
+| kern : swap=0    pid_max=32768     conn=128    aslr=0       |
 | pkgs :  curl bash                                           |
 +--------------------------------------------------------------+
 EOMOTD

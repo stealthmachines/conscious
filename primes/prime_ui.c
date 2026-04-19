@@ -1238,6 +1238,81 @@ static int lattice_derive_nr_cpus(void) {
     return opts[(int)(v * 8)];
 }
 
+/* ── Slots 41-50: Per-process scheduler parameters ───────────────────────── */
+
+/* Scheduler policy: slot[41] → 0=OTHER  1=FIFO  2=RR  3=BATCH  4=IDLE */
+static int lattice_derive_sched_policy(void) {
+    double v = (lattice_N > 41) ? lattice[41] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 5);
+}
+
+/* RT priority (SCHED_FIFO / SCHED_RR): slot[42] → 1..99 */
+static int lattice_derive_rt_prio(void) {
+    double v = (lattice_N > 42) ? lattice[42] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return 1 + (int)(v * 98);
+}
+
+/* CPU affinity bitmask: slot[43] → 0x01..0xFF (at least 1 CPU always set) */
+static unsigned int lattice_derive_cpu_affinity(void) {
+    double v = (lattice_N > 43) ? lattice[43] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (unsigned int)(v * 255) + 1;
+}
+
+/* cgroup cpu.weight: slot[44] → 1..10000 (cgroup v2) */
+static int lattice_derive_cgroup_weight(void) {
+    double v = (lattice_N > 44) ? lattice[44] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return 1 + (int)(v * 9999);
+}
+
+/* CPU quota %: slot[45] → {25, 50, 75, 100=unlimited} */
+static int lattice_derive_cpu_quota(void) {
+    static const int opts[] = { 25, 50, 75, 100 };
+    double v = (lattice_N > 45) ? lattice[45] : 0.999;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return opts[(int)(v * 4)];
+}
+
+/* OOM score adjustment: slot[46] → -500..500 */
+static int lattice_derive_oom_adj(void) {
+    double v = (lattice_N > 46) ? lattice[46] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return -500 + (int)(v * 1000);
+}
+
+/* I/O scheduler class: slot[47] → 0=none  1=realtime  2=best-effort  3=idle */
+static int lattice_derive_ionice_class(void) {
+    double v = (lattice_N > 47) ? lattice[47] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 4);
+}
+
+/* I/O priority level: slot[48] → 0..7 */
+static int lattice_derive_ionice_level(void) {
+    double v = (lattice_N > 48) ? lattice[48] : 0.5;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return (int)(v * 8);
+}
+
+/* Memory cgroup limit: slot[49] → {64,128,256,512,1024,2048,4096,0=unlimited} MB */
+static int lattice_derive_mem_limit_mb(void) {
+    static const int opts[] = { 64, 128, 256, 512, 1024, 2048, 4096, 0 };
+    double v = (lattice_N > 49) ? lattice[49] : 0.999;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return opts[(int)(v * 8)];
+}
+
+/* Stack ulimit kB: slot[50] → {65536,131072,262144,524288,1048576,0=unlimited} */
+static int lattice_derive_stack_kb(void) {
+    static const int opts[] = { 65536, 131072, 262144, 524288, 1048576, 0 };
+    double v = (lattice_N > 50) ? lattice[50] : 0.999;
+    if (v < 0.0) v = 0.0; if (v >= 1.0) v = 0.999;
+    return opts[(int)(v * 6)];
+}
+
 /* ── File writers ───────────────────────────────────────────────────────── */
 
 /* Write all N slot double values as raw IEEE-754 bytes → entropy pool */
@@ -1704,6 +1779,142 @@ static void lattice_write_kbuild_sh(const char *path) {
     fclose(f);
 }
 
+/*
+ * Write lattice_proc.sh — applies lattice-derived per-process scheduler
+ * settings inside the phi4096-lattice Alpine container.
+ *
+ * Actions performed by the script:
+ *   1. Install chrt / taskset / ionice via apk
+ *   2. Create cgroup v2 lattice_procs with cpu.weight + cpu.max + memory.max
+ *   3. Write /usr/local/bin/sched_run — lattice-pinned process launcher
+ *   4. Write /etc/profile.d/lattice_sched.sh — exports env to all new shells
+ *   5. Apply sched policy, affinity, nice, ionice, OOM adj to current PID
+ *   6. Add current shell to lattice_procs cgroup
+ *   7. Set stack ulimit
+ */
+static void lattice_write_proc_sh(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+
+    static const char *policy_name[] = { "SCHED_OTHER", "SCHED_FIFO", "SCHED_RR", "SCHED_BATCH", "SCHED_IDLE" };
+    static const char *chrt_flag[]   = { "-o", "-f", "-r", "-b", "-i" };
+    static const char *io_name[]     = { "none", "realtime", "best-effort", "idle" };
+
+    int policy      = lattice_derive_sched_policy();
+    int rt_prio     = lattice_derive_rt_prio();
+    unsigned int aff= lattice_derive_cpu_affinity();
+    int weight      = lattice_derive_cgroup_weight();
+    int quota       = lattice_derive_cpu_quota();
+    int oom_adj     = lattice_derive_oom_adj();
+    int io_class    = lattice_derive_ionice_class();
+    int io_level    = lattice_derive_ionice_level();
+    int mem_mb      = lattice_derive_mem_limit_mb();
+    int stack_kb    = lattice_derive_stack_kb();
+    int nice_val    = lattice_derive_nice();
+    uint64_t seed   = lattice_derive_seed();
+
+    fprintf(f, "#!/bin/sh\n"
+               "# lattice_proc.sh -- phi4096 lattice-native process scheduler\n"
+               "# Seed: 0x%016llx   Slots: %d\n\n",
+               (unsigned long long)seed, lattice_N);
+
+    /* 1. Install toolchain */
+    fputs("echo '[lattice-proc] Installing scheduler tools...'\n"
+          "apk add --quiet util-linux schedutils 2>/dev/null || "
+          "apk add --quiet util-linux 2>/dev/null\n\n", f);
+
+    /* 2. cgroup v2 setup */
+    fputs("echo '[lattice-proc] Configuring cgroup v2 lattice_procs...'\n"
+          "mount | grep -q cgroup2 || "
+          "mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null\n"
+          "mkdir -p /sys/fs/cgroup/lattice_procs 2>/dev/null\n"
+          "echo '+cpu +memory +io' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null\n", f);
+    fprintf(f, "echo '%d' > /sys/fs/cgroup/lattice_procs/cpu.weight 2>/dev/null\n", weight);
+    if (quota == 100)
+        fputs("echo 'max 100000' > /sys/fs/cgroup/lattice_procs/cpu.max 2>/dev/null\n", f);
+    else
+        fprintf(f, "echo '%d000 100000' > /sys/fs/cgroup/lattice_procs/cpu.max 2>/dev/null\n", quota);
+    if (mem_mb > 0)
+        fprintf(f, "echo '%dM' > /sys/fs/cgroup/lattice_procs/memory.max 2>/dev/null\n\n", mem_mb);
+    else
+        fputs("echo 'max' > /sys/fs/cgroup/lattice_procs/memory.max 2>/dev/null\n\n", f);
+
+    /* 3. Write /usr/local/bin/sched_run */
+    fputs("echo '[lattice-proc] Writing /usr/local/bin/sched_run...'\n"
+          "cat > /usr/local/bin/sched_run << 'SCHED_RUN_EOF'\n"
+          "#!/bin/sh\n"
+          "# lattice-native process launcher -- spawns $@ under lattice scheduler\n", f);
+    if (policy == 1 || policy == 2)
+        fprintf(f, "exec chrt %s %d \"$@\"\n", chrt_flag[policy], rt_prio);
+    else
+        fprintf(f, "exec chrt %s 0 \"$@\"\n", chrt_flag[policy]);
+    fputs("SCHED_RUN_EOF\n"
+          "chmod +x /usr/local/bin/sched_run\n\n", f);
+
+    /* 4. Write /etc/profile.d/lattice_sched.sh */
+    fputs("echo '[lattice-proc] Writing /etc/profile.d/lattice_sched.sh...'\n"
+          "cat > /etc/profile.d/lattice_sched.sh << 'PROF_EOF'\n", f);
+    fprintf(f, "export SCHED_POLICY=%s\n", policy_name[policy]);
+    if (policy == 1 || policy == 2)
+        fprintf(f, "export SCHED_RT_PRIO=%d\n", rt_prio);
+    fprintf(f, "export SCHED_NICE=%d\n", nice_val);
+    fprintf(f, "export SCHED_AFFINITY=0x%02x\n", aff);
+    fprintf(f, "export IONICE_CLASS=%s\n", io_name[io_class]);
+    fprintf(f, "export IONICE_LEVEL=%d\n", io_level);
+    fprintf(f, "export CGROUP_WEIGHT=%d\n", weight);
+    if (mem_mb > 0)
+        fprintf(f, "export MEM_LIMIT=%dM\n", mem_mb);
+    else
+        fputs("export MEM_LIMIT=unlimited\n", f);
+    fputs("alias run='sched_run'\n"
+          "echo \"[lattice-sched] policy=$SCHED_POLICY  affinity=$SCHED_AFFINITY"
+          "  cgroup-weight=$CGROUP_WEIGHT\"\n"
+          "PROF_EOF\n\n", f);
+
+    /* 5. Apply to current shell process */
+    fputs("echo '[lattice-proc] Applying scheduler to current shell (PID $$)...'\n", f);
+    if (policy == 1 || policy == 2)
+        fprintf(f, "chrt %s -p %d $$ 2>/dev/null "
+                   "&& echo '  policy: %s (rt_prio=%d)' "
+                   "|| echo '  [warn] chrt unavailable'\n",
+                   chrt_flag[policy], rt_prio, policy_name[policy], rt_prio);
+    else
+        fprintf(f, "chrt %s -p 0 $$ 2>/dev/null "
+                   "&& echo '  policy: %s' "
+                   "|| echo '  [warn] chrt unavailable'\n",
+                   chrt_flag[policy], policy_name[policy]);
+
+    fprintf(f, "taskset -p 0x%02x $$ 2>/dev/null "
+               "&& echo '  affinity: 0x%02x' "
+               "|| echo '  [warn] taskset unavailable'\n", aff, aff);
+    fprintf(f, "renice -n %d -p $$ 2>/dev/null "
+               "&& echo '  nice: %+d' || true\n", nice_val, nice_val);
+    if (io_class > 0)
+        fprintf(f, "ionice -c %d -n %d -p $$ 2>/dev/null "
+                   "&& echo '  ionice: class=%s level=%d' "
+                   "|| echo '  [warn] ionice unavailable'\n",
+                   io_class, io_level, io_name[io_class], io_level);
+    fprintf(f, "echo '%d' > /proc/$$/oom_score_adj 2>/dev/null "
+               "&& echo '  oom_score_adj: %+d' || true\n", oom_adj, oom_adj);
+
+    /* 6. cgroup membership */
+    fprintf(f, "echo $$ > /sys/fs/cgroup/lattice_procs/cgroup.procs 2>/dev/null "
+               "&& echo '  cgroup: lattice_procs (weight=%d)' || true\n", weight);
+
+    /* 7. Stack ulimit */
+    if (stack_kb > 0)
+        fprintf(f, "ulimit -s %d 2>/dev/null && echo '  stack: %d kB' || true\n",
+                stack_kb / 1024, stack_kb / 1024);
+    else
+        fputs("ulimit -s unlimited 2>/dev/null && echo '  stack: unlimited' || true\n", f);
+
+    fputs("\necho '[lattice-proc] Lattice-native process environment active.'\n"
+          "echo \"  Run any command under the lattice scheduler: sched_run <cmd>\"\n"
+          "echo \"  Or use the alias:  run <cmd>\"\n", f);
+
+    fclose(f);
+}
+
 static void module_alpine_os(void) {
     printf("\n" CYAN
         "+--------------------------------------------------------------+\n"
@@ -2138,6 +2349,131 @@ static void module_kernel_build(void) {
     printf("\n  " GRN "Build container exited. Output in: %s\n" CR "\n", kbuild_dir);
 }
 
+static void module_proc_sched(void) {
+    static const char *policy_name[] = { "SCHED_OTHER", "SCHED_FIFO", "SCHED_RR", "SCHED_BATCH", "SCHED_IDLE" };
+    static const char *io_name[]     = { "none", "realtime", "best-effort", "idle" };
+
+    int policy      = lattice_derive_sched_policy();
+    int rt_prio     = lattice_derive_rt_prio();
+    unsigned int aff= lattice_derive_cpu_affinity();
+    int weight      = lattice_derive_cgroup_weight();
+    int quota       = lattice_derive_cpu_quota();
+    int oom_adj     = lattice_derive_oom_adj();
+    int io_class    = lattice_derive_ionice_class();
+    int io_level    = lattice_derive_ionice_level();
+    int mem_mb      = lattice_derive_mem_limit_mb();
+    int stack_kb    = lattice_derive_stack_kb();
+    int nice_val    = lattice_derive_nice();
+
+    printf("\n" CYAN
+        "+--------------------------------------------------------------+\n"
+        "|  Process Scheduler  --  Lattice-Native Process Engine       |\n"
+        "+--------------------------------------------------------------+\n"
+        CR "\n");
+
+    printf("  " BOLD "Lattice-derived process parameters (slots 41-50):" CR "\n");
+    printf("    Sched policy       : " GRN "%-16s" CR "  slot[41]\n", policy_name[policy]);
+    if (policy == 1 || policy == 2)
+        printf("    RT priority        : " GRN "%d" CR "                slot[42]\n", rt_prio);
+    printf("    Nice value         : " GRN "%+d" CR "               slot[17]\n", nice_val);
+    printf("    CPU affinity mask  : " GRN "0x%02x" CR "            slot[43]  (%d CPU(s))\n",
+           aff, __builtin_popcount(aff));
+    printf("    cgroup cpu.weight  : " GRN "%-6d" CR "          slot[44]  (1=min, 10000=max)\n", weight);
+    printf("    CPU quota %%        : " GRN "%d%%" CR "%s  slot[45]\n",
+           quota, quota == 100 ? " (unlimited)" : "            ");
+    printf("    OOM score adj      : " GRN "%+d" CR "            slot[46]\n", oom_adj);
+    printf("    I/O class          : " GRN "%-12s" CR "   slot[47]\n", io_name[io_class]);
+    if (io_class > 0 && io_class < 3)
+        printf("    I/O level          : " GRN "%d" CR "                slot[48]\n", io_level);
+    if (mem_mb > 0)
+        printf("    Memory cgroup max  : " GRN "%dM" CR "            slot[49]\n", mem_mb);
+    else
+        printf("    Memory cgroup max  : " GRN "unlimited" CR "        slot[49]\n");
+    if (stack_kb > 0)
+        printf("    Stack ulimit       : " GRN "%d kB" CR "         slot[50]\n", stack_kb / 1024);
+    else
+        printf("    Stack ulimit       : " GRN "unlimited" CR "        slot[50]\n");
+
+    printf("\n  " DIM "Linux side: chrt | taskset | ionice | cgroup v2\n"
+           "  Writes /usr/local/bin/sched_run (lattice-pinned launcher)\n"
+           "  Writes /etc/profile.d/lattice_sched.sh (env for all shells)\n" CR "\n");
+
+    /* ── Apply to this Windows process immediately ── */
+    printf("  " BOLD "Applying to current Windows process..." CR "\n");
+    HANDLE hp = GetCurrentProcess();
+
+    DWORD wclass;
+    if      (policy == 1 || policy == 2) wclass = REALTIME_PRIORITY_CLASS;
+    else if (policy == 3)                wclass = BELOW_NORMAL_PRIORITY_CLASS;
+    else if (policy == 4)                wclass = IDLE_PRIORITY_CLASS;
+    else if (nice_val < -10)             wclass = HIGH_PRIORITY_CLASS;
+    else if (nice_val < 0)               wclass = ABOVE_NORMAL_PRIORITY_CLASS;
+    else if (nice_val > 10)              wclass = BELOW_NORMAL_PRIORITY_CLASS;
+    else                                 wclass = NORMAL_PRIORITY_CLASS;
+
+    if (SetPriorityClass(hp, wclass)) {
+        const char *wcn =
+            (wclass == REALTIME_PRIORITY_CLASS)    ? "REALTIME"     :
+            (wclass == HIGH_PRIORITY_CLASS)        ? "HIGH"         :
+            (wclass == ABOVE_NORMAL_PRIORITY_CLASS)? "ABOVE_NORMAL" :
+            (wclass == BELOW_NORMAL_PRIORITY_CLASS)? "BELOW_NORMAL" :
+            (wclass == IDLE_PRIORITY_CLASS)        ? "IDLE"         : "NORMAL";
+        printf("  " GRN "  PriorityClass: %s\n" CR, wcn);
+    }
+
+    DWORD_PTR sys_mask = 0, proc_mask = 0;
+    if (GetProcessAffinityMask(hp, &proc_mask, &sys_mask)) {
+        DWORD_PTR lat_mask = (DWORD_PTR)aff & sys_mask;
+        if (!lat_mask) lat_mask = sys_mask;
+        if (SetProcessAffinityMask(hp, lat_mask))
+            printf("  " GRN "  AffinityMask:  0x%llx  (system: 0x%llx)\n" CR,
+                   (unsigned long long)lat_mask, (unsigned long long)sys_mask);
+    }
+
+    /* ── Optionally apply to running container ── */
+    printf("\n  " BOLD "Apply to phi4096-lattice container? [y/N] " CR);
+    fflush(stdout);
+
+    DWORD oldP; GetConsoleMode(g_hin, &oldP);
+    SetConsoleMode(g_hin, ENABLE_PROCESSED_INPUT|ENABLE_ECHO_INPUT|ENABLE_LINE_INPUT);
+    WCHAR wbP[8] = {0}; DWORD nrP = 0;
+    ReadConsoleW(g_hin, wbP, 7, &nrP, NULL);
+    SetConsoleMode(g_hin, oldP);
+    char chP = (wbP[0] > 0 && wbP[0] <= 127) ? (char)wbP[0] : 'n';
+    if (chP != 'y' && chP != 'Y') {
+        printf("  " DIM "Skipped.\n" CR "\n");
+        return;
+    }
+
+    /* Check container */
+    int live = 0;
+    {
+        FILE *cp = _popen("docker inspect --format={{.State.Status}} phi4096-lattice 2>NUL", "r");
+        if (cp) { char st[32] = {0}; if (fgets(st, sizeof(st), cp) && strstr(st, "running")) live = 1; _pclose(cp); }
+    }
+    if (!live) {
+        printf("  " RED "[warn] phi4096-lattice not running. Start via [8] Alpine OS Shell first.\n" CR "\n");
+        return;
+    }
+
+    char cwd_p[MAX_PATH], proc_sh_path[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, cwd_p);
+    snprintf(proc_sh_path, sizeof(proc_sh_path), "%s\\lattice_proc.sh", cwd_p);
+    lattice_write_proc_sh(proc_sh_path);
+
+    /* docker cp then exec */
+    char cp_cmd[MAX_PATH + 128];
+    snprintf(cp_cmd, sizeof(cp_cmd),
+             "docker cp \"%s\" phi4096-lattice:/tmp/lattice_proc.sh >nul 2>&1",
+             proc_sh_path);
+    system(cp_cmd);
+    system("docker exec -it phi4096-lattice sh /tmp/lattice_proc.sh");
+
+    printf("\n  " GRN "Lattice-native process environment applied.\n" CR
+           "  " DIM "  sched_run  is now available inside the container.\n"
+           "  All new shells will source /etc/profile.d/lattice_sched.sh\n" CR "\n");
+}
+
 static void print_menu(void) {
     int live = 0;
     {
@@ -2162,6 +2498,7 @@ static void print_menu(void) {
     else
         printf("  " YEL "[8]" CR " Alpine OS Shell      spawn lattice-powered Alpine Linux\n");
     printf("  " YEL "[9]" CR " Kernel Build         compile lattice-native Linux kernel\n");
+    printf("  " YEL "[A]" CR " Process Scheduler    lattice-native per-process CPU/IO/cgroup\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -2191,6 +2528,7 @@ int main(void) {
         case '7': module_lattice_shell(); break;
         case '8': module_alpine_os();       break;
         case '9': module_kernel_build();     break;
+        case 'a': module_proc_sched();       break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
