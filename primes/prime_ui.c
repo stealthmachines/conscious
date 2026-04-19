@@ -4567,7 +4567,7 @@ static void module_lk_bench(void) {
         lk_read("lk-bench-cold", out32, 32);
         sink ^= out32[0];
     }
-    t1 = now_s(); print_bench_row("lk_read(32B) [PRK dirty — 3x SHA256/32KB]", (t1-t0)*1e6, N);
+    t1 = now_s(); print_bench_row("lk_read(32B) [PRK dirty — phi_fold/32KB]", (t1-t0)*1e6, N);
 
     double hot_us  = 0.0, cold_us = 0.0;
     { /* re-measure to get per-op values for the speedup ratio */
@@ -4670,7 +4670,7 @@ static void module_lk_bench(void) {
     sc_t[40] ^= 0x01;  /* byte 40 = first ciphertext byte (past ctr[8]+tag[32]) */
     int td_ok = (lk_unseal(sc_t, sc_t_sz, pl_t, 32) == -1);
     printf("    tamper detect : %s\n", td_ok
-           ? GRN "[OK — AES-GCM tag rejected]" CR
+           ? GRN "[OK — phi_fold tag rejected]" CR
            : RED "[FAIL — accepted tampered ciphertext]" CR);
     all_ok &= td_ok;
 
