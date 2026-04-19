@@ -4062,14 +4062,21 @@ static void lk_hash_lattice(uint8_t h[32]) {
     sha256_final(&s, h);
 }
 
+/* PRK cache: invalidated by lk_advance(), avoids 3× SHA-256(32 KB) per read */
+static uint8_t lk_prk_cache[32];
+static int     lk_prk_dirty = 1;
+
 /* Master PRK: HKDF-Extract(sha256(lattice[0..255]), full lattice bytes) */
 static void lk_derive_prk(uint8_t prk[32]) {
+    if (!lk_prk_dirty) { memcpy(prk, lk_prk_cache, 32); return; }
     uint8_t salt[32]; Sha256Ctx s; sha256_init(&s);
     int n = (lattice_N < 256) ? lattice_N : 256;
     sha256_update(&s, (const uint8_t*)lattice, (size_t)n * sizeof(double));
     sha256_final(&s, salt);
     hkdf_extract(salt, 32, (const uint8_t*)lattice,
                  (size_t)lattice_N * sizeof(double), prk);
+    memcpy(lk_prk_cache, prk, 32);
+    lk_prk_dirty = 0;
 }
 
 /* Derive n bytes for a named context (domain separation via HKDF-Expand) */
@@ -4087,6 +4094,7 @@ static void lk_advance(void) {
     for (int i = 0; i < 32 && (size_t)i < cap; i++) lb[i] ^= os[i];
     lattice_step();
     lattice_seed_steps_done++;
+    lk_prk_dirty = 1;   /* invalidate PRK cache after ratchet */
     memset(os, 0, 32);
 }
 
@@ -4249,6 +4257,171 @@ static void module_lk(void) {
     printf("    audit      lk_commit()              → PCR chain, attested boot\n\n");
     printf("    No key store.  No PKI.  No key manager daemon.\n");
     printf("    The lattice state IS the security state.\n\n");
+}
+
+/* ══════════════════════════ MODULE J: Lattice Kernel Benchmark ═══════════════
+ *  Throughput for all lk_ primitives.  Correctness verification.
+ *  Demonstrates the PRK-cache optimization: cold vs hot lk_read.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static void module_lk_bench(void) {
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [J] Lattice Kernel Benchmark  --  throughput + correctness   |\n"
+        "+================================================================+\n"
+        CR "\n");
+
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+
+    double t0, t1; long N; volatile uint8_t sink = 0;
+    uint8_t out32[32];
+
+    /* ── J1: lk_read hot-path (PRK cached) ── */
+    printf("  " BOLD "J1  lk_read  --  hot path vs cold path" CR "\n");
+    lk_read("warmup", out32, 32);            /* prime the cache */
+    N = 50000; t0 = now_s();
+    for (long i = 0; i < N; i++) {
+        lk_read("lk-bench-hot", out32, 32);
+        sink ^= out32[0];
+    }
+    t1 = now_s(); print_bench_row("lk_read(32B) [PRK cached]", (t1-t0)*1e6, N);
+
+    N = 500; t0 = now_s();
+    for (long i = 0; i < N; i++) {
+        lk_prk_dirty = 1;                    /* force full recompute each call */
+        lk_read("lk-bench-cold", out32, 32);
+        sink ^= out32[0];
+    }
+    t1 = now_s(); print_bench_row("lk_read(32B) [PRK dirty — 3x SHA256/32KB]", (t1-t0)*1e6, N);
+
+    double hot_us  = 0.0, cold_us = 0.0;
+    { /* re-measure to get per-op values for the speedup ratio */
+        lk_read("warmup2", out32, 32);
+        long Nh = 20000; t0 = now_s();
+        for (long i = 0; i < Nh; i++) { lk_read("lk-ratio", out32, 32); sink ^= out32[0]; }
+        hot_us = (now_s()-t0)*1e6 / (double)Nh;
+        long Nc = 200; t0 = now_s();
+        for (long i = 0; i < Nc; i++) { lk_prk_dirty=1; lk_read("lk-ratio", out32, 32); sink ^= out32[0]; }
+        cold_us = (now_s()-t0)*1e6 / (double)Nc;
+    }
+    printf("    PRK cache speedup : " YEL "%.0fx" CR "  (%.2f us cold  →  %.0f ns hot)\n\n",
+           cold_us / hot_us, cold_us, hot_us * 1000.0);
+
+    /* ── J2: lk_advance (ratchet rate) ── */
+    printf("  " BOLD "J2  lk_advance  --  ratchet rate" CR "\n");
+    N = 500; t0 = now_s();
+    for (long i = 0; i < N; i++) lk_advance();
+    t1 = now_s(); print_bench_row("lk_advance() [BCrypt+SHA256+step]", (t1-t0)*1e6, N);
+    printf("\n");
+
+    /* ── J3: lk_commit (PCR attestation sign rate) ── */
+    printf("  " BOLD "J3  lk_commit  --  PCR attestation rate" CR "\n");
+    uint8_t sig[64], pub[32];
+    N = 100; t0 = now_s();
+    for (long i = 0; i < N; i++) { lk_commit(sig, pub); sink ^= sig[0]; }
+    t1 = now_s(); print_bench_row("lk_commit() [Ed25519 sign + H(lat)]", (t1-t0)*1e6, N);
+    printf("\n");
+
+    /* ── J4: lk_seal / lk_unseal throughput ── */
+    printf("  " BOLD "J4  lk_seal / lk_unseal  --  AES-256-GCM throughput" CR "\n");
+    static const uint8_t PT64[64] =
+        "phi-lattice-sealed-storage-64B--benchmark-payload-0123456789AB";
+    uint8_t sealed64[64+28], plain64[64];
+    N = 20000; t0 = now_s();
+    for (long i = 0; i < N; i++) { lk_seal(PT64, 64, sealed64, sizeof(sealed64)); sink ^= sealed64[0]; }
+    t1 = now_s(); print_bench_row("lk_seal(64B)   [AES-256-GCM]", (t1-t0)*1e6, N);
+    lk_seal(PT64, 64, sealed64, sizeof(sealed64));
+    N = 20000; t0 = now_s();
+    for (long i = 0; i < N; i++) { lk_unseal(sealed64, 64+28, plain64, 64); sink ^= plain64[0]; }
+    t1 = now_s(); print_bench_row("lk_unseal(64B) [AES-256-GCM]", (t1-t0)*1e6, N);
+
+    uint8_t *pt4k = (uint8_t*)malloc(4096);
+    uint8_t *sc4k = (uint8_t*)malloc(4096+28);
+    uint8_t *pl4k = (uint8_t*)malloc(4096);
+    if (pt4k && sc4k && pl4k) {
+        memset(pt4k, 0xAB, 4096);
+        N = 3000; t0 = now_s();
+        for (long i = 0; i < N; i++) { lk_seal(pt4k, 4096, sc4k, 4096+28); sink ^= sc4k[0]; }
+        t1 = now_s(); print_bench_row("lk_seal(4KB)   [AES-256-GCM]", (t1-t0)*1e6, N);
+        double bw_enc = (double)N * 4096.0 / ((t1-t0) * 1e6);
+        lk_seal(pt4k, 4096, sc4k, 4096+28);
+        N = 3000; t0 = now_s();
+        for (long i = 0; i < N; i++) { lk_unseal(sc4k, 4096+28, pl4k, 4096); sink ^= pl4k[0]; }
+        t1 = now_s(); print_bench_row("lk_unseal(4KB) [AES-256-GCM]", (t1-t0)*1e6, N);
+        double bw_dec = (double)N * 4096.0 / ((t1-t0) * 1e6);
+        printf("    seal BW  : " YEL "%.1f MB/s" CR "   unseal BW : " YEL "%.1f MB/s" CR "  (AES-NI)\n\n",
+               bw_enc, bw_dec);
+    }
+    free(pt4k); free(sc4k); free(pl4k);
+
+    /* ── J5: lk_proc_context throughput ── */
+    printf("  " BOLD "J5  lk_proc_context  --  per-PID key derivation" CR "\n");
+    uint8_t pkey[32];
+    N = 30000; t0 = now_s();
+    for (long i = 0; i < N; i++) { lk_proc_context((uint32_t)(i & 0xFFFF), pkey); sink ^= pkey[0]; }
+    t1 = now_s(); print_bench_row("lk_proc_context(pid)", (t1-t0)*1e6, N);
+    printf("\n");
+
+    /* ── J6: correctness verification ── */
+    printf("  " BOLD "J6  Correctness" CR "\n");
+    int all_ok = 1;
+
+    /* determinism: same ctx → same output, 200 reads */
+    uint8_t ref[32], rep[32];
+    lk_read("lk-det-v1", ref, 32);
+    int det_ok = 1;
+    for (int i = 0; i < 200; i++) {
+        lk_read("lk-det-v1", rep, 32);
+        if (memcmp(ref, rep, 32)) { det_ok = 0; break; }
+    }
+    printf("    determinism   : %s\n", det_ok
+           ? GRN "[OK — 200 identical reads]" CR : RED "[FAIL]" CR);
+    all_ok &= det_ok;
+
+    /* PRK cache consistency: hot == cold (same lattice) */
+    uint8_t k_hot[32], k_cold[32];
+    lk_read("lk-cache-chk", k_hot, 32);
+    lk_prk_dirty = 1;
+    lk_read("lk-cache-chk", k_cold, 32);
+    int cache_ok = (memcmp(k_hot, k_cold, 32) == 0);
+    printf("    PRK cache     : %s\n", cache_ok
+           ? GRN "[OK — cached == recomputed]" CR : RED "[FAIL — divergence]" CR);
+    all_ok &= cache_ok;
+
+    /* tamper detection: flip 1 byte past nonce+tag boundary, unseal must fail */
+    uint8_t pt_t[32]; memcpy(pt_t, "tamper-detect-test-payload!!!!!!", 32);
+    uint8_t sc_t[32+28], pl_t[32];
+    lk_seal(pt_t, 32, sc_t, sizeof(sc_t));
+    sc_t[28] ^= 0x01;  /* byte 28 = first ciphertext byte (past nonce[12]+tag[16]) */
+    int td_ok = (lk_unseal(sc_t, 32+28, pl_t, 32) == -1);
+    printf("    tamper detect : %s\n", td_ok
+           ? GRN "[OK — AES-GCM tag rejected]" CR
+           : RED "[FAIL — accepted tampered ciphertext]" CR);
+    all_ok &= td_ok;
+
+    /* round-trip: 1 B, 128 B, 4096 B */
+    int rt_ok = 1;
+    static const size_t SZLIST[3] = {1, 128, 4096};
+    for (int si = 0; si < 3; si++) {
+        size_t sz = SZLIST[si];
+        uint8_t *orig = (uint8_t*)malloc(sz);
+        uint8_t *sld  = (uint8_t*)malloc(sz + 28);
+        uint8_t *rec  = (uint8_t*)malloc(sz);
+        if (!orig || !sld || !rec) { free(orig); free(sld); free(rec); rt_ok = 0; break; }
+        for (size_t k = 0; k < sz; k++) orig[k] = (uint8_t)(k * 7 + 13);
+        size_t ssz = lk_seal(orig, sz, sld, sz + 28);
+        int rr = lk_unseal(sld, ssz, rec, sz);
+        if (rr != (int)sz || memcmp(orig, rec, sz)) rt_ok = 0;
+        free(orig); free(sld); free(rec);
+    }
+    printf("    round-trip    : %s\n", rt_ok
+           ? GRN "[OK — 1B / 128B / 4KB]" CR : RED "[FAIL]" CR);
+    all_ok &= rt_ok;
+
+    printf("\n  " DIM "sink=%02x" CR "  (dead-code guard)\n", sink);
+    printf("\n  " BOLD "Summary" CR ": %s\n\n",
+           all_ok ? GRN "All J6 correctness checks passed." CR
+                  : RED "One or more correctness checks FAILED." CR);
 }
 
 /* ══════════════════════════ MAIN ════════════════════════════════════════════ */
@@ -5752,6 +5925,7 @@ static void print_menu(void) {
     printf("  " YEL "[G]" CR " Wu-Wei Codec          fold26 lattice-adaptive compression\n");
     printf("  " YEL "[H]" CR " PhiSign               Ed25519 twisted Edwards sign/verify (lattice-keyed)\n");
     printf("  " YEL "[I]" CR " Lattice Kernel        lk_read/advance/commit  — cryptographic OS root\n");
+    printf("  " YEL "[J]" CR " Kernel Benchmark      throughput + correctness for all lk_ primitives\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -5783,6 +5957,7 @@ int main(int argc, char *argv[]) {
         case 'g': module_wuwei_codec();              break;
         case 'h': module_phisign();                  break;
         case 'i': module_lk();                       break;
+        case 'j': module_lk_bench();                 break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -5818,6 +5993,7 @@ int main(int argc, char *argv[]) {
         case 'g': module_wuwei_codec();            break;
         case 'h': module_phisign();                break;
         case 'i': module_lk();                     break;
+        case 'j': module_lk_bench();               break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
