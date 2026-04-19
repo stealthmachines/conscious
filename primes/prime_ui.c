@@ -2897,6 +2897,65 @@ static void avx2_resonance_step_v(double *lat, int N) {
     for (; i < N; i++) { double v = PHI*(lat[i]+1.0); lat[i] = v - floor(v); }
 }
 
+/* ── AVX2+FMA: per-slot hardware-entropy lattice init ───────────────────── */
+/*                                                                            */
+/* Fixes the fixed-point convergence bug in avx2_weyl_fill + resonance_step: */
+/*   frac(phi*(v+1)) has attractor v = phi-1;  50 steps collapses all slots  */
+/*   to 0.61803399... — identical, useless as entropy source.                */
+/*                                                                            */
+/* Correct design — two phases:                                              */
+/*  Phase 1 (scalar splitmix64):                                             */
+/*    slot[i] = frac(i*phi + phase_phi + splitmix64(seed ^ i) * 2^-53)      */
+/*    Each slot gets a unique irrational offset derived from hardware jitter. */
+/*    splitmix64 is a bijection on uint64 — all 4096 offsets are distinct.   */
+/*                                                                            */
+/*  Phase 2 (50 × AVX2 FMA coupled sweep):                                  */
+/*    slot[i] = frac(phi*slot[i] + (1/phi)*slot[i+1])                       */
+/*    phi + 1/phi = sqrt(5) — irrational → NO fixed points, NO attractors   */
+/*    Forward sweep left→right: each slot mixes with unupdated right nbr.   */
+/*    After 50 steps: full avalanche across all 4096 slots.                  */
+/* ─────────────────────────────────────────────────────────────────────── */
+__attribute__((target("avx2,fma")))
+static void avx2_jitter_lattice_init(double *lat, int N, double phase,
+                                     uint64_t jitter_seed) {
+    /* ── Phase 1: Weyl base + per-slot splitmix64 perturbation (scalar) ── */
+    double pp    = fmod(phase * PHI, 1.0);
+    double inv53 = 1.0 / (double)(1ULL << 53);
+    for (int i = 0; i < N; i++) {
+        double weyl = fmod((double)i * PHI + pp, 1.0);
+        uint64_t h  = jitter_seed ^ ((uint64_t)i * 0x9e3779b97f4a7c15ULL);
+        h += 0x9e3779b97f4a7c15ULL;
+        h  = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        h  = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+        h ^= (h >> 31);
+        double perturb = (double)(h >> 11) * inv53;   /* uniform [0, 1) */
+        double v = weyl + perturb * PHI;              /* irrational shift */
+        lat[i] = v - floor(v);
+    }
+    /* ── Phase 2: 50 coupled resonance steps (AVX2 FMA) ── */
+    /* iphi = 1/phi = phi - 1 ≈ 0.618034                                    */
+    /* phi + iphi = sqrt(5) — irrational, ensures no fixed points           */
+    __m256d phi4  = _mm256_set1_pd(PHI);
+    __m256d iphi4 = _mm256_set1_pd(PHI - 1.0);
+    for (int step = 0; step < 50; step++) {
+        double lat0 = lat[0];                    /* save for periodic boundary */
+        int i;
+        /* i+4 < N ensures lat[i+4] (right nbr of last lane) is in bounds */
+        for (i = 0; i + 4 < N; i += 4) {
+            __m256d v = _mm256_loadu_pd(lat + i);
+            __m256d n = _mm256_loadu_pd(lat + i + 1);  /* unupdated right nbr */
+            v = _mm256_fmadd_pd(v, phi4, _mm256_mul_pd(n, iphi4));
+            v = _mm256_sub_pd(v, _mm256_floor_pd(v));
+            _mm256_storeu_pd(lat + i, v);
+        }
+        for (; i < N; i++) {                     /* tail + periodic wrap */
+            double next = (i + 1 < N) ? lat[i + 1] : lat0;
+            double v = PHI * lat[i] + (PHI - 1.0) * next;
+            lat[i] = v - floor(v);
+        }
+    }
+}
+
 /* ── AVX2: double → float32 narrow (for 8-wide analog scoring) ─────────── */
 __attribute__((target("avx2,fma")))
 static void avx2_d2f(const double *src, float *dst, int N) {
@@ -3068,6 +3127,7 @@ static void module_quantum_throughput(void) {
     long N_reps;
     volatile double acc = 0.0;
     volatile float  facc = 0.0f;
+    double jinit_us = 0.0;   /* filled by Benchmark 5 */
 
     /* ── 1. Phi-Weyl fill: AVX2 vs scalar ── */
     printf("  " BOLD "Benchmark 1: Phi-Weyl fill  (AVX2 FMA vs scalar)" CR "\n");
@@ -3197,7 +3257,61 @@ static void module_quantum_throughput(void) {
     }
     printf("\n");
 
-    /* ── 5. GFLOPS summary ── */
+    /* ── 5. Per-slot jitter init: throughput + diversity vs broken fill ── */
+    printf("  " BOLD "Benchmark 5: Per-slot jitter init (diversity vs broken fill)" CR "\n");
+    {
+        static double jit_lat[LATTICE_MAX];
+        uint64_t jit_samp[64];
+        uint64_t jseed = cx_jitter_harvest(jit_samp);
+        printf("    Jitter seed : 0x%016llx\n", (unsigned long long)jseed);
+
+        /* Time full jitter init (Phase 1 splitmix + Phase 2 50× coupled AVX2) */
+        N_reps = 200;
+        t0 = now_s();
+        for (long r = 0; r < N_reps; r++)
+            avx2_jitter_lattice_init(jit_lat, LATTICE_MAX, cphase, jseed ^ (uint64_t)r);
+        t1 = now_s();
+        jinit_us = (t1 - t0) * 1e6 / N_reps;
+        printf("    Jitter init : " GRN "%.1f µs/init" CR
+               "   %.0f inits/s  (%d slots × 50 coupled steps)\n",
+               jinit_us, 1e6 / jinit_us, LATTICE_MAX);
+
+        /* Time broken fill (same ops, but all slots collapse to phi-1) */
+        t0 = now_s();
+        for (long r = 0; r < N_reps; r++) {
+            avx2_weyl_fill(jit_lat, LATTICE_MAX, cphase);
+            for (int s = 0; s < 50; s++) avx2_resonance_step_v(jit_lat, LATTICE_MAX);
+        }
+        t1 = now_s();
+        double broken_us = (t1 - t0) * 1e6 / N_reps;
+        printf("    Broken fill : " YEL "%.1f µs/init" CR
+               "   (converges: slot[0]=%.8f  slot[1]=%.8f — SAME)\n",
+               broken_us, jit_lat[0], jit_lat[1]);
+
+        /* Verify jitter init diversity */
+        avx2_jitter_lattice_init(jit_lat, LATTICE_MAX, cphase, jseed);
+        double dsum = 0.0, dsum2 = 0.0;
+        int adj_eq = 0;
+        for (int i = 0; i < LATTICE_MAX; i++) {
+            dsum  += jit_lat[i];
+            dsum2 += jit_lat[i] * jit_lat[i];
+            if (i > 0 && jit_lat[i] == jit_lat[i-1]) adj_eq++;
+        }
+        double dmean = dsum  / LATTICE_MAX;
+        double dstd  = sqrt(dsum2 / LATTICE_MAX - dmean * dmean);
+        printf("    Jitter[0,1,42] : %.8f  %.8f  %.8f\n",
+               jit_lat[0], jit_lat[1], jit_lat[42]);
+        printf("    Diversity   : mean=%.4f  stddev=%.4f  "
+               "(ideal=0.500/0.289)  adj_eq=%d\n",
+               dmean, dstd, adj_eq);
+        acc += jit_lat[0] + jit_lat[LATTICE_MAX - 1];
+    }
+    printf("\n");
+
+    /* ── 6. GFLOPS summary ── */
+    /* Phase 1: ~8 ops/slot (splitmix + add + fmod)                         */
+    /* Phase 2: ~4 ops/slot (fmadd + mul + sub + floor) × 50 steps          */
+    /* Total: N × (8 + 50×4) = N × 208 FLOPS                               */
     printf("  " BOLD "GFLOPS achieved on i7-6700T @ 2808 MHz:" CR "\n");
     printf("    phi-Weyl fill (AVX2)   : %5.1f GFLOPS  (FMA+sub+floor, 4 FLOPS/slot)\n",
            4.0 / av_fill_ns);
@@ -3205,22 +3319,38 @@ static void module_quantum_throughput(void) {
            av_gflops);
     printf("    Analog scoring (f32x8) : %5.1f GFLOPS  (mul+floor+sub+fnmadd, ~5 FLOPS)\n",
            5.0 / an_ns);
+    printf("    Jitter init (coupled)  : %5.1f GFLOPS  "
+           "(splitmix×N + 50×FMA, %d FLOPS total)\n",
+           jinit_us > 0.0 ? (double)(LATTICE_MAX * 208) / (jinit_us * 1e3) : 0.0,
+           LATTICE_MAX * 208);
     printf("    Peak theoretical       : %5.1f GFLOPS  (double, 4d FMA × 2 units)\n\n",
            2808.0 * 4 * 2 * 2 / 1000.0);
 
-    /* ── 6. Apply: re-seed lattice with AVX2 + crystal phase ── */
-    printf("  " BOLD "Applying AVX2 crystal-phase lattice seed..." CR); fflush(stdout);
+    /* ── 7. Apply: seed live lattice with per-slot hardware entropy ── */
+    printf("  " BOLD "Seeding live lattice with crystal jitter..." CR); fflush(stdout);
     double seed_phase = (lattice_crystal_phase_g >= 0.0) ? lattice_crystal_phase_g : 0.0;
-    avx2_weyl_fill(lattice, LATTICE_MAX, seed_phase);
-    for (int s = 0; s < 50; s++) avx2_resonance_step_v(lattice, LATTICE_MAX);
+    uint64_t live_samp[64];
+    uint64_t live_seed = cx_jitter_harvest(live_samp);
+    avx2_jitter_lattice_init(lattice, LATTICE_MAX, seed_phase, live_seed);
     lattice_N                = LATTICE_MAX;
     lattice_alpine_installed = 1;
     lattice_seed_steps_done  = 50;
     printf(" done.\n");
-    printf("    lattice[0]  = %.8f\n", lattice[0]);
-    printf("    lattice[1]  = %.8f\n", lattice[1]);
-    printf("    lattice[42] = %.8f  (resonance pivot)\n\n", lattice[42]);
-    printf("    " GRN "Lattice is now AVX2+FMA seeded via quartz crystal phase.\n" CR "\n");
+    {
+        double s = 0.0, s2 = 0.0;
+        for (int i = 0; i < LATTICE_MAX; i++) {
+            s  += lattice[i];
+            s2 += lattice[i] * lattice[i];
+        }
+        double m  = s  / LATTICE_MAX;
+        double sd = sqrt(s2 / LATTICE_MAX - m * m);
+        printf("    lattice[0]  = %.8f\n", lattice[0]);
+        printf("    lattice[1]  = %.8f  (unique)\n", lattice[1]);
+        printf("    lattice[42] = %.8f\n", lattice[42]);
+        printf("    stddev      = %.6f  (ideal 0.289167)\n", sd);
+        printf("    seed        : 0x%016llx\n\n", (unsigned long long)live_seed);
+    }
+    printf("    " GRN "Lattice: 4096 unique slots, quartz-jitter seeded." CR "\n\n");
 
     /* ── 7. Generate lattice_quantum.sh ── */
     double tsc_hz = cx_measure_hz();

@@ -1,6 +1,6 @@
 #!/bin/sh
 # lattice_quantum.sh  -- AVX2/FMA3 quantum throughput (Linux/Alpine)
-# Crystal: 24000000 Hz  TSC: 2807.980 MHz
+# Crystal: 24000000 Hz  TSC: 2807.996 MHz
 set -e
 
 echo ''
