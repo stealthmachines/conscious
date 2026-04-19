@@ -1,4 +1,4 @@
-# conscious — Quantum Prime & Phi-Lattice Cryptographic Platform
+# conscious —  Prime & Phi-Lattice Cryptographic Platform
 *by [zchg.org](https://zchg.org)*
 
 > A self-correcting spectral Markov dynamical sieve, Mersenne prime engine,
