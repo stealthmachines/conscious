@@ -4064,7 +4064,10 @@ static void lk_hash_lattice(uint8_t h[32]) {
 
 /* PRK cache: invalidated by lk_advance(), avoids 3× SHA-256(32 KB) per read */
 static uint8_t lk_prk_cache[32];
-static int     lk_prk_dirty = 1;
+static int      lk_prk_dirty  = 1;
+static uint64_t lk_seal_ctr   = 0;       /* monotonic nonce counter — no reuse within epoch */
+static uint8_t  lk_pcr_prev[32];         /* previous commit hash — chained PCR              */
+static uint64_t lk_pcr_seqno  = 0;       /* monotonic commit sequence number                */
 
 /* Master PRK: HKDF-Extract(sha256(lattice[0..255]), full lattice bytes) */
 static void lk_derive_prk(uint8_t prk[32]) {
@@ -4098,24 +4101,44 @@ static void lk_advance(void) {
     memset(os, 0, 32);
 }
 
-/* Commit: derive attest keypair, sign H(lattice), output sig + pub.
- * Call phisign_verify(sig, pub, msg, 32) where msg = lk_hash_lattice(). */
-static void lk_commit(uint8_t sig[64], uint8_t pub[32]) {
+/* Commit (full): chained PCR attestation.
+ *   signed msg = SHA256(H(lattice) || pcr_prev[32] || seqno_le64[8])
+ *   after sign:  pcr_prev = SHA256(sig),  seqno++
+ * Verify: phisign_verify(sig, pub, msg_out, 32) */
+static void lk_commit_full(uint8_t sig[64], uint8_t pub[32], uint8_t msg_out[32]) {
     uint8_t seed[32]; lk_read("lk-attest-v1", seed, 32);
     Ed25519Key kp; phisign_from_seed(seed, &kp);
-    uint8_t msg[32]; lk_hash_lattice(msg);
-    phisign_sign(sig, &kp, msg, 32);
+    uint8_t lat_h[32]; lk_hash_lattice(lat_h);
+    uint8_t buf[72];
+    memcpy(buf,    lat_h,          32);
+    memcpy(buf+32, lk_pcr_prev,    32);
+    memcpy(buf+64, &lk_pcr_seqno,   8);
+    Sha256Ctx sc; sha256_init(&sc);
+    sha256_update(&sc, buf, 72);
+    sha256_final(&sc, msg_out);
+    phisign_sign(sig, &kp, msg_out, 32);
     memcpy(pub, kp.pub, 32);
+    /* advance chain: pcr_prev = SHA256(sig), seqno++ */
+    sha256_init(&sc); sha256_update(&sc, sig, 64); sha256_final(&sc, lk_pcr_prev);
+    lk_pcr_seqno++;
     memset(seed, 0, 32); memset(kp.priv, 0, 32);
 }
 
+static void lk_commit(uint8_t sig[64], uint8_t pub[32]) {
+    uint8_t msg[32]; lk_commit_full(sig, pub, msg); (void)msg;
+}
+
 /* Seal: derive key+nonce from lattice, AES-256-GCM encrypt.
+ * Nonce = HKDF_base[32..43] XOR lk_seal_ctr(8B) — unique per seal within epoch.
  * Output: nonce[12] | tag[16] | ct[ptlen].  Returns sealed byte count. */
 static size_t lk_seal(const uint8_t *pt, size_t ptlen, uint8_t *out, size_t cap) {
     if (cap < ptlen + 28) return 0;
-    uint8_t km[44]; lk_read("lk-seal-v1", km, 44); /* km[0..31]=key, km[32..43]=nonce */
+    uint8_t km[44]; lk_read("lk-seal-v1", km, 44); /* km[0..31]=key, km[32..43]=base nonce */
+    /* XOR monotonic counter into first 8 nonce bytes — prevents reuse within epoch */
+    for (int i = 0; i < 8; i++) km[32+i] ^= (uint8_t)((lk_seal_ctr >> (i*8)) & 0xFF);
+    lk_seal_ctr++;
     Aes256GcmKey gk; aes256gcm_keyschedule(km, gk.ks);
-    memcpy(out, km + 32, 12);                        /* nonce → output[0..11] */
+    memcpy(out, km + 32, 12);                        /* unique nonce → output[0..11] */
     aes256gcm_encrypt(&gk, km + 32, pt, ptlen, NULL, 0, out + 28, out + 12);
     memset(km, 0, 44);
     return ptlen + 28;
@@ -4137,6 +4160,41 @@ static int lk_unseal(const uint8_t *in, size_t inlen, uint8_t *pt, size_t cap) {
 static void lk_proc_context(uint32_t pid, uint8_t key[32]) {
     char ctx[20]; snprintf(ctx, sizeof(ctx), "lk-proc-%08x", (unsigned)pid);
     lk_read(ctx, key, 32);
+}
+
+/* Gateway WRITE: wu-wei compress → lk_seal → sealed blob.
+ * All data leaving the OS boundary is compressed+sealed atomically.
+ * The lattice hint biases wu-wei strategy — no separate config needed.
+ * lk_advance() is the caller's responsibility (OS ratchets on its schedule). */
+static size_t lk_gateway_write(const uint8_t *pt, size_t ptlen,
+                                uint8_t *out, size_t cap) {
+    if (!pt || !ptlen || !out || cap < 29) return 0;
+    uint8_t hb[2]; lk_read("lk-gw-hint", hb, 2);
+    float hint = (float)((uint32_t)hb[0] | ((uint32_t)hb[1] << 8)) / 65535.0f;
+    float ent = ww_entropy(pt, ptlen), cor = ww_correlation(pt, ptlen),
+          rep = ww_repetition(pt, ptlen);
+    WuWeiStrat strat = ww_select(ent, cor, rep, hint);
+    uint8_t *cbuf = (uint8_t*)malloc(ptlen * 4 + 64);
+    if (!cbuf) return 0;
+    size_t csz = ww_compress(pt, ptlen, cbuf, ptlen * 4 + 64, strat);
+    size_t ssz = (cap >= csz + 28) ? lk_seal(cbuf, csz, out, cap) : 0;
+    free(cbuf);
+    return ssz;
+}
+
+/* Gateway READ: lk_unseal → wu-wei decompress → plaintext.
+ * Returns plaintext length on success, -1 on authentication failure. */
+static int lk_gateway_read(const uint8_t *in, size_t inlen,
+                            uint8_t *pt, size_t cap) {
+    if (!in || inlen < 28 || !pt || !cap) return -1;
+    size_t cbuf_cap = cap * 4 + 64;
+    uint8_t *cbuf = (uint8_t*)malloc(cbuf_cap);
+    if (!cbuf) return -1;
+    int csz = lk_unseal(in, inlen, cbuf, cbuf_cap);
+    if (csz < 0) { free(cbuf); return -1; }
+    size_t psz = ww_decompress(cbuf, (size_t)csz, pt, cap);
+    free(cbuf);
+    return (psz > 0) ? (int)psz : -1;
 }
 
 static void module_lk(void) {
@@ -4172,15 +4230,16 @@ static void module_lk(void) {
                                : RED "[FAIL — domain separation broken]" CR);
 
     /* ── I2: PCR attestation ── */
-    printf("  " BOLD "I2  PCR attestation  (lk_commit)" CR "\n");
-    uint8_t sig[64], attest_pub[32], hmsg[32];
-    lk_commit(sig, attest_pub);
-    lk_hash_lattice(hmsg);
-    int att_ok = phisign_verify(sig, attest_pub, hmsg, 32);
+    printf("  " BOLD "I2  PCR attestation  (lk_commit — chained PCR)" CR "\n");
+    uint8_t sig[64], attest_pub[32], cmsg[32];
+    lk_commit_full(sig, attest_pub, cmsg);
+    int att_ok = phisign_verify(sig, attest_pub, cmsg, 32);
+    uint8_t hmsg[32]; lk_hash_lattice(hmsg);
     printf("    H(lattice) : "); for(int i=0;i<16;i++) printf("%02x",hmsg[i]);       printf("...\n");
+    printf("    PCR seqno  : %llu\n", (unsigned long long)(lk_pcr_seqno-1));
     printf("    sig[R]     : "); for(int i=0;i<16;i++) printf("%02x",sig[i]);        printf("...\n");
     printf("    attest pub : "); for(int i=0;i<16;i++) printf("%02x",attest_pub[i]); printf("...\n");
-    printf("    verify     : %s\n\n", att_ok == 0 ? GRN "[OK]" CR : RED "[FAIL]" CR);
+    printf("    verify     : %s\n\n", att_ok == 0 ? GRN "[OK — chained PCR]" CR : RED "[FAIL]" CR);
 
     /* ── I3: sealed storage ── */
     printf("  " BOLD "I3  Sealed storage  (lk_seal / lk_unseal)" CR "\n");
@@ -4239,8 +4298,7 @@ static void module_lk(void) {
     if (!sbuf) { free(cbuf); printf("    " RED "[ERR] malloc\n" CR); return; }
     size_t sealed_sz = lk_seal(cbuf, csz, sbuf, csz + 28);
     /* attest the post-seal lattice state */
-    uint8_t psig[64], ppub[32]; lk_commit(psig, ppub);
-    uint8_t pmsg[32]; lk_hash_lattice(pmsg);
+    uint8_t psig[64], ppub[32], pmsg[32]; lk_commit_full(psig, ppub, pmsg);
     int pat = phisign_verify(psig, ppub, pmsg, 32);
     free(cbuf); free(sbuf);
     printf("    snapshot   : %zu B  →  wu-wei \"%s\"  →  %zu B\n",
@@ -4422,6 +4480,174 @@ static void module_lk_bench(void) {
     printf("\n  " BOLD "Summary" CR ": %s\n\n",
            all_ok ? GRN "All J6 correctness checks passed." CR
                   : RED "One or more correctness checks FAILED." CR);
+}
+
+/* ══════════════════════════ MODULE K: Lattice Gateway ══════════════════════
+ *  Everything that crosses the OS boundary passes through here.
+ *
+ *    lk_gateway_write(pt)  →  ww_compress → lk_seal  →  sealed blob
+ *    lk_gateway_read(blob) →  lk_unseal   → ww_decompress  →  plaintext
+ *
+ *  Properties by construction (no policy, no config):
+ *    Authenticated   AES-256-GCM tag rejects any tampered blob
+ *    Confidential    key = HKDF(phi[4096]) — lattice-bound
+ *    State-epoch     blob sealed in epoch N is inaccessible in epoch N+1
+ *    Data-adaptive   wu-wei selects compression from the data's own entropy
+ *    Forward-secret  lk_advance() — past key not recoverable
+ *    Attested        lk_commit_full() chains PCR — proof of OS state
+ *
+ *  Wu-wei meets lattice: data chooses its own path; the lattice chooses
+ *  the key.  Neither needs a separate policy engine.  No forcing.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void module_lk_gateway(void) {
+    printf("\n" CYAN
+        "+================================================================+\n"
+        "|  [K] Lattice Gateway  --  Everything Through the Lattice      |\n"
+        "+================================================================+\n"
+        CR "\n");
+    printf("  Wu-wei + Lattice as a unified OS security choke point.\n");
+    printf("  All cross-boundary data: compressed \u2192 sealed \u2192 attested.\n\n");
+
+    if (!lattice_alpine_installed) lattice_seed_phi(4096, 50);
+
+    /* \u2500\u2500 K1: PCR chain linkage \u2500\u2500 */
+    printf("  " BOLD "K1  PCR chain linkage  (lk_commit_full \u00d7 3)" CR "\n");
+    uint64_t seq0 = lk_pcr_seqno;
+    uint8_t sig0[64], pub0[32], msg0[32]; lk_commit_full(sig0, pub0, msg0);
+    uint8_t sig1[64], pub1[32], msg1[32]; lk_commit_full(sig1, pub1, msg1);
+    uint8_t sig2[64], pub2[32], msg2[32]; lk_commit_full(sig2, pub2, msg2);
+
+    int c0 = phisign_verify(sig0, pub0, msg0, 32) == 0;
+    int c1 = phisign_verify(sig1, pub1, msg1, 32) == 0;
+    int c2 = phisign_verify(sig2, pub2, msg2, 32) == 0;
+
+    /* verify chain: msg1 must incorporate SHA256(sig0) as pcr_prev */
+    uint8_t pcr_after0[32];
+    { Sha256Ctx sc; sha256_init(&sc); sha256_update(&sc,sig0,64); sha256_final(&sc,pcr_after0); }
+    uint8_t lat_h[32]; lk_hash_lattice(lat_h);
+    uint8_t exp1_buf[72]; uint8_t exp1[32];
+    memcpy(exp1_buf,    lat_h,       32);
+    memcpy(exp1_buf+32, pcr_after0,  32);
+    uint64_t seq1 = seq0 + 1;
+    memcpy(exp1_buf+64, &seq1,        8);
+    { Sha256Ctx sc; sha256_init(&sc); sha256_update(&sc,exp1_buf,72); sha256_final(&sc,exp1); }
+    int chain_ok = (memcmp(msg1, exp1, 32) == 0);
+
+    printf("    commit[0]  : %s  seqno=%llu\n",
+           c0 ? GRN "[OK]" CR : RED "[FAIL]" CR, (unsigned long long)seq0);
+    printf("    commit[1]  : %s  seqno=%llu\n",
+           c1 ? GRN "[OK]" CR : RED "[FAIL]" CR, (unsigned long long)(seq0+1));
+    printf("    commit[2]  : %s  seqno=%llu\n",
+           c2 ? GRN "[OK]" CR : RED "[FAIL]" CR, (unsigned long long)(seq0+2));
+    printf("    chain link : %s  (msg[1]=SHA256(H(lat)||pcr[0]||seqno))\n\n",
+           chain_ok ? GRN "[OK]" CR : RED "[FAIL]" CR);
+
+    /* \u2500\u2500 K2: nonce uniqueness across seals \u2500\u2500 */
+    printf("  " BOLD "K2  Nonce uniqueness  (lk_seal \u00d7 40)" CR "\n");
+    static const uint8_t PT8[8] = "gateway!";
+    uint8_t nonces[40][12];
+    uint8_t stmp[8 + 28];
+    for (int i = 0; i < 40; i++) {
+        lk_seal(PT8, 8, stmp, sizeof(stmp));
+        memcpy(nonces[i], stmp, 12);
+    }
+    int nonce_ok = 1;
+    for (int i = 0; i < 40 && nonce_ok; i++)
+        for (int j = i+1; j < 40 && nonce_ok; j++)
+            if (memcmp(nonces[i], nonces[j], 12) == 0) nonce_ok = 0;
+    printf("    40 seals   : %s\n\n",
+           nonce_ok ? GRN "[OK \u2014 all nonces distinct]" CR
+                    : RED "[FAIL \u2014 nonce collision]" CR);
+
+    /* \u2500\u2500 K3: gateway round-trip \u2500\u2500 */
+    printf("  " BOLD "K3  Gateway round-trip  (lk_gateway_write / lk_gateway_read)" CR "\n");
+    static const char *MSGS[3] = {
+        "phi-lattice OS gateway: syscall data crosses this boundary sealed.",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "01234567890123456789012345678901234567890123456789"
+    };
+    int gw_ok = 1;
+    for (int t = 0; t < 3; t++) {
+        size_t ptlen = strlen(MSGS[t]);
+        uint8_t *sealed = (uint8_t*)malloc(ptlen * 4 + 64);
+        uint8_t *plain  = (uint8_t*)malloc(ptlen + 4);
+        if (!sealed || !plain) { free(sealed); free(plain); gw_ok = 0; break; }
+        size_t ssz = lk_gateway_write((const uint8_t*)MSGS[t], ptlen, sealed, ptlen*4+64);
+        int psz = lk_gateway_read(sealed, ssz, plain, ptlen + 4);
+        int ok = (psz == (int)ptlen) && (memcmp(plain, MSGS[t], ptlen) == 0);
+        printf("    msg[%d] %zu B \u2192 sealed %zu B  \u2192  %s\n",
+               t, ptlen, ssz, ok ? GRN "[OK]" CR : RED "[FAIL]" CR);
+        if (!ok) gw_ok = 0;
+        free(sealed); free(plain);
+    }
+    printf("\n");
+
+    /* \u2500\u2500 K4: state-epoch binding \u2500\u2500 */
+    printf("  " BOLD "K4  Epoch binding  (sealed in N, inaccessible in N+1)" CR "\n");
+    static const uint8_t EP_PT[] = "epoch-N data: sealed, belongs to this lattice state only";
+    uint8_t ep_sealed[sizeof(EP_PT) + 28];
+    uint8_t ep_plain[sizeof(EP_PT)];
+    size_t  ep_ssz = lk_seal(EP_PT, sizeof(EP_PT)-1, ep_sealed, sizeof(ep_sealed));
+    /* epoch N: must succeed */
+    int ep_pre  = (lk_unseal(ep_sealed, ep_ssz, ep_plain, sizeof(ep_plain))
+                   == (int)(sizeof(EP_PT)-1));
+    /* ratchet to epoch N+1 */
+    lk_advance();
+    /* epoch N+1: must fail \u2014 different key */
+    int ep_post = (lk_unseal(ep_sealed, ep_ssz, ep_plain, sizeof(ep_plain)) == -1);
+    printf("    epoch N    : unseal %s\n",
+           ep_pre  ? GRN "[OK]" CR : RED "[FAIL]" CR);
+    printf("    epoch N+1  : unseal %s  (lattice-state-bound)\n\n",
+           ep_post ? GRN "[REJECTED \u2014 correct]" CR
+                   : RED "[FAIL \u2014 accepted stale epoch]" CR);
+
+    /* \u2500\u2500 K5: full OS pipeline \u2500\u2500 */
+    printf("  " BOLD "K5  Full OS pipeline  (write \u2192 read \u2192 commit \u2192 advance)" CR "\n");
+    static const uint8_t SYS[] = "write(fd=3, count=512): sensitive syscall payload";
+    uint8_t *gw5  = (uint8_t*)malloc(sizeof(SYS)*4 + 64);
+    uint8_t *dec5 = (uint8_t*)malloc(sizeof(SYS) + 4);
+    if (!gw5 || !dec5) { free(gw5); free(dec5); return; }
+    /* 1. gateway seals syscall data in epoch N */
+    size_t sz5 = lk_gateway_write(SYS, sizeof(SYS)-1, gw5, sizeof(SYS)*4+64);
+    /* 2. OS consumes it before advancing */
+    int r5  = lk_gateway_read(gw5, sz5, dec5, sizeof(SYS)+4);
+    int rt5 = (r5 == (int)(sizeof(SYS)-1)) && (memcmp(dec5, SYS, sizeof(SYS)-1) == 0);
+    /* 3. PCR attestation of epoch-N state */
+    uint8_t k5sig[64], k5pub[32], k5msg[32]; lk_commit_full(k5sig, k5pub, k5msg);
+    int k5att = phisign_verify(k5sig, k5pub, k5msg, 32) == 0;
+    /* 4. advance epoch \u2014 forward secrecy */
+    lk_advance();
+    /* 5. epoch-N blob is now inaccessible */
+    uint8_t dead[sizeof(SYS)];
+    int stale = (lk_gateway_read(gw5, sz5, dead, sizeof(dead)) == -1);
+    /* 6. new epoch: write+read works normally */
+    size_t sz5b = lk_gateway_write(SYS, sizeof(SYS)-1, gw5, sizeof(SYS)*4+64);
+    int r5b = lk_gateway_read(gw5, sz5b, dec5, sizeof(SYS)+4);
+    int rt5b = (r5b == (int)(sizeof(SYS)-1)) && (memcmp(dec5, SYS, sizeof(SYS)-1) == 0);
+    free(gw5); free(dec5);
+
+    printf("    write      : %zu B  (epoch N, wu-wei sealed)\n", sz5);
+    printf("    read       : %s\n",
+           rt5   ? GRN "[OK \u2014 consumed in epoch N]"     CR : RED "[FAIL]" CR);
+    printf("    PCR attest : %s  (seqno=%llu)\n",
+           k5att ? GRN "[OK]" CR : RED "[FAIL]" CR,
+           (unsigned long long)(lk_pcr_seqno-1));
+    printf("    advance    : \u2192 epoch N+1  (phi-ratchet, prior state gone)\n");
+    printf("    stale blob : %s\n",
+           stale ? GRN "[REJECTED \u2014 epoch-N key expired]" CR
+                 : RED "[FAIL \u2014 accepted stale]" CR);
+    printf("    new epoch  : %s\n\n",
+           rt5b  ? GRN "[OK \u2014 epoch N+1 gateway round-trip]" CR : RED "[FAIL]" CR);
+
+    printf("  " BOLD "Gateway model (the closure):" CR "\n");
+    printf("    Every byte crossing the OS boundary is:\n");
+    printf("      1. Data-adaptively compressed   (wu-wei \u2014 no config, data chooses path)\n");
+    printf("      2. Lattice-sealed               (AES-256-GCM \u2014 key from phi[4096])\n");
+    printf("      3. State-epoch bound            (inaccessible after lk_advance)\n");
+    printf("      4. PCR-attested                 (chained PhiSign \u2014 tamper-evident)\n\n");
+    printf("    The lattice controls all of it.  Wu-wei provides the path.\n");
+    printf("    No key store.  No PKI.  No policy engine.\n\n");
 }
 
 /* ══════════════════════════ MAIN ════════════════════════════════════════════ */
@@ -5926,6 +6152,7 @@ static void print_menu(void) {
     printf("  " YEL "[H]" CR " PhiSign               Ed25519 twisted Edwards sign/verify (lattice-keyed)\n");
     printf("  " YEL "[I]" CR " Lattice Kernel        lk_read/advance/commit  — cryptographic OS root\n");
     printf("  " YEL "[J]" CR " Kernel Benchmark      throughput + correctness for all lk_ primitives\n");
+    printf("  " YEL "[K]" CR " Lattice Gateway        wu-wei + lk — cryptographic OS I/O choke point\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -5958,6 +6185,7 @@ int main(int argc, char *argv[]) {
         case 'h': module_phisign();                  break;
         case 'i': module_lk();                       break;
         case 'j': module_lk_bench();                 break;
+        case 'k': module_lk_gateway();               break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -5994,6 +6222,7 @@ int main(int argc, char *argv[]) {
         case 'h': module_phisign();                break;
         case 'i': module_lk();                     break;
         case 'j': module_lk_bench();               break;
+        case 'k': module_lk_gateway();             break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
