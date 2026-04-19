@@ -4098,7 +4098,7 @@ static void module_wuwei_codec(void) {
     printf("\n  " BOLD "Kernel codec role:" CR "\n");
     printf("    Kernel image sections  -> wu-wei fold -> Noise_XX AEAD encrypt\n");
     printf("    Entropy pool snapshots -> phi-CSPRNG state -> wu-wei fold -> sealed\n");
-    printf("    Noise_XX payloads      -> ww_compress -> AES-256-GCM (module [F])\n");
+    printf("    Noise_XX payloads      -> ww_compress -> phi_stream AEAD (module [F])\n");
     printf("    Log streams            -> streaming fold26 64KB chunks, O(1) mem\n\n");
 
     printf("  " BOLD "Lattice-first wu-wei:" CR "\n");
@@ -4121,7 +4121,7 @@ static void module_wuwei_codec(void) {
  *    lk_commit(sig, pub)     PhiSign(H(lattice)) = PCR-equivalent attestation
  *
  *  Higher-level OS primitives are pure composition:
- *    lk_seal / lk_unseal     sealed storage  (AES-256-GCM, key from lattice)
+ *    lk_seal / lk_unseal     sealed storage  (phi_stream AEAD, key from lattice)
  *    lk_proc_context(pid)    per-process entropy isolation
  *
  *  OS model (lattice as hardware security register):
@@ -4586,7 +4586,7 @@ static void module_lk_bench(void) {
     printf("  " BOLD "J2  lk_advance  --  ratchet rate" CR "\n");
     N = 500; t0 = now_s();
     for (long i = 0; i < N; i++) lk_advance();
-    t1 = now_s(); print_bench_row("lk_advance() [BCrypt+SHA256+step]", (t1-t0)*1e6, N);
+    t1 = now_s(); print_bench_row("lk_advance() [phi_fold+RDTSC+step]", (t1-t0)*1e6, N);
     printf("\n");
 
     /* ── J3: lk_commit (PCR attestation sign rate) ── */
@@ -4594,37 +4594,37 @@ static void module_lk_bench(void) {
     uint8_t sig[64], pub[32];
     N = 100; t0 = now_s();
     for (long i = 0; i < N; i++) { lk_commit(sig, pub); sink ^= sig[0]; }
-    t1 = now_s(); print_bench_row("lk_commit() [Ed25519 sign + H(lat)]", (t1-t0)*1e6, N);
+    t1 = now_s(); print_bench_row("lk_commit() [PhiSign + phi_fold(lat)]", (t1-t0)*1e6, N);
     printf("\n");
 
     /* ── J4: lk_seal / lk_unseal throughput ── */
-    printf("  " BOLD "J4  lk_seal / lk_unseal  --  AES-256-GCM throughput" CR "\n");
+    printf("  " BOLD "J4  lk_seal / lk_unseal  --  phi_stream AEAD throughput" CR "\n");
     static const uint8_t PT64[64] =
         "phi-lattice-sealed-storage-64B--benchmark-payload-0123456789AB";
-    uint8_t sealed64[64+28], plain64[64];
+    uint8_t sealed64[64+40], plain64[64];
     N = 20000; t0 = now_s();
     for (long i = 0; i < N; i++) { lk_seal(PT64, 64, sealed64, sizeof(sealed64)); sink ^= sealed64[0]; }
-    t1 = now_s(); print_bench_row("lk_seal(64B)   [AES-256-GCM]", (t1-t0)*1e6, N);
+    t1 = now_s(); print_bench_row("lk_seal(64B)   [phi_stream AEAD]", (t1-t0)*1e6, N);
     lk_seal(PT64, 64, sealed64, sizeof(sealed64));
     N = 20000; t0 = now_s();
-    for (long i = 0; i < N; i++) { lk_unseal(sealed64, 64+28, plain64, 64); sink ^= plain64[0]; }
-    t1 = now_s(); print_bench_row("lk_unseal(64B) [AES-256-GCM]", (t1-t0)*1e6, N);
+    for (long i = 0; i < N; i++) { lk_unseal(sealed64, 64+40, plain64, 64); sink ^= plain64[0]; }
+    t1 = now_s(); print_bench_row("lk_unseal(64B) [phi_stream AEAD]", (t1-t0)*1e6, N);
 
     uint8_t *pt4k = (uint8_t*)malloc(4096);
-    uint8_t *sc4k = (uint8_t*)malloc(4096+28);
+    uint8_t *sc4k = (uint8_t*)malloc(4096+40);
     uint8_t *pl4k = (uint8_t*)malloc(4096);
     if (pt4k && sc4k && pl4k) {
         memset(pt4k, 0xAB, 4096);
         N = 3000; t0 = now_s();
-        for (long i = 0; i < N; i++) { lk_seal(pt4k, 4096, sc4k, 4096+28); sink ^= sc4k[0]; }
-        t1 = now_s(); print_bench_row("lk_seal(4KB)   [AES-256-GCM]", (t1-t0)*1e6, N);
+        for (long i = 0; i < N; i++) { lk_seal(pt4k, 4096, sc4k, 4096+40); sink ^= sc4k[0]; }
+        t1 = now_s(); print_bench_row("lk_seal(4KB)   [phi_stream AEAD]", (t1-t0)*1e6, N);
         double bw_enc = (double)N * 4096.0 / ((t1-t0) * 1e6);
-        lk_seal(pt4k, 4096, sc4k, 4096+28);
+        lk_seal(pt4k, 4096, sc4k, 4096+40);
         N = 3000; t0 = now_s();
-        for (long i = 0; i < N; i++) { lk_unseal(sc4k, 4096+28, pl4k, 4096); sink ^= pl4k[0]; }
-        t1 = now_s(); print_bench_row("lk_unseal(4KB) [AES-256-GCM]", (t1-t0)*1e6, N);
+        for (long i = 0; i < N; i++) { lk_unseal(sc4k, 4096+40, pl4k, 4096); sink ^= pl4k[0]; }
+        t1 = now_s(); print_bench_row("lk_unseal(4KB) [phi_stream AEAD]", (t1-t0)*1e6, N);
         double bw_dec = (double)N * 4096.0 / ((t1-t0) * 1e6);
-        printf("    seal BW  : " YEL "%.1f MB/s" CR "   unseal BW : " YEL "%.1f MB/s" CR "  (AES-NI)\n\n",
+        printf("    seal BW  : " YEL "%.1f MB/s" CR "   unseal BW : " YEL "%.1f MB/s" CR "  (phi_stream)\n\n",
                bw_enc, bw_dec);
     }
     free(pt4k); free(sc4k); free(pl4k);
@@ -5101,7 +5101,7 @@ static void module_phi_vault(void) {
         free(rb3); free(pl3);
     }
     printf("    tampered vault: %s\n\n",
-           n2 ? GRN "[REJECTED \u2014 AES-GCM auth tag failed]" CR
+           n2 ? GRN "[REJECTED \u2014 phi_fold tag rejected]" CR
               : RED "[FAIL \u2014 accepted corrupted data]" CR);
 
     /* N3: epoch binding */
