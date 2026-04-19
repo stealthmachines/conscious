@@ -40,6 +40,7 @@ taskkill /f /im "%OUT%" >nul 2>&1
 echo [prime_ui] Building with clang -O2...
 "%CLANG%" ^
     -O2 ^
+    -mavx2 -mfma ^
     -D_CRT_SECURE_NO_WARNINGS ^
     -D_USE_MATH_DEFINES ^
     "%SRC%" -o "%OUT%"

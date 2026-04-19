@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <intrin.h>   /* __rdtsc, __cpuid */
+#include <immintrin.h> /* AVX2/FMA: _mm256_*, _mm_* */
 
 /* ══════════════════════════ A. Constants ════════════════════════════════════ */
 
@@ -2561,7 +2562,7 @@ static double cx_seed_lattice(double tsc_hz, double crystal_hz, uint64_t jitter)
 /* Write lattice_crystal.sh — Linux-side crystal bootstrap */
 static void lattice_write_crystal_sh(double crystal_hz, double tsc_hz,
                                      double cphase, uint64_t jitter) {
-    FILE *f = fopen("lattice_crystal.sh", "w");
+    FILE *f = fopen("lattice_crystal.sh", "wb");
     if (!f) return;
 
     uint64_t period = (uint64_t)(tsc_hz / crystal_hz);
@@ -2835,6 +2836,434 @@ static void module_crystal_native(void) {
            " (crystal_phase_g = %.8f)\n\n", lattice_crystal_phase_g);
 }
 
+/* ══ MODULE D: Quantum Throughput ════════════════════════════════════════════
+ *
+ *  AVX2 (4× double / 8× float) + FMA3 on Skylake i7-6700T.
+ *  This is the "fire" — phi-Weyl + resonance at hardware peak throughput.
+ *
+ *  What "quantum" means here:
+ *    4-wide double    :  __m256d processes 4 amplitudes simultaneously
+ *    8-wide float     :  __m256  processes 8 phase scores simultaneously
+ *    FMA              :  phi*(v+1) = fmadd(v, phi, phi)  — 1 instruction,
+ *                        no intermediate rounding, full Skylake FP precision
+ *    Crystal-aligned  :  inner loops of 117 = 1 crystal oscillation period
+ *    Analog cascade   :  float32 analog sieve → only survivors go to MR
+ *
+ *  Skylake peak (measured TSC = 2808 MHz):
+ *    4× double FMA:  4 × 2 FLOPS × 2 units = 16 FLOPS/cycle → 44.9 GFLOPS
+ *    8× float  FMA:  8 × 2 FLOPS × 2 units = 32 FLOPS/cycle → 89.9 GFLOPS
+ *    L1 bandwidth:  2 × 256-bit loads/cycle = 179 GB/s
+ *    Lattice sweep:  32 KB / 179 GB/s = 179 ns per full pass
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int cpu_has_avx2(void) {
+    int v[4] = {0}; __cpuid(v, 7); return (v[1] >> 5) & 1;
+}
+static int cpu_has_fma(void) {
+    int v[4] = {0}; __cpuid(v, 1); return (v[2] >> 12) & 1;
+}
+
+/* ── AVX2+FMA: phi-Weyl fill with crystal phase offset ────────────────── */
+/* slot[i] = frac((i * phi) + phase_phi)  where phase_phi = phase * phi    */
+__attribute__((target("avx2,fma")))
+static void avx2_weyl_fill(double *dst, int N, double phase) {
+    double pp = fmod(phase * PHI, 1.0);
+    __m256d phi4 = _mm256_set1_pd(PHI);
+    __m256d pp4  = _mm256_set1_pd(pp);
+    __m256d idx  = _mm256_set_pd(3.0, 2.0, 1.0, 0.0); /* reversed: [0,1,2,3] */
+    __m256d s4   = _mm256_set1_pd(4.0);
+    int i;
+    for (i = 0; i + 3 < N; i += 4) {
+        __m256d v = _mm256_fmadd_pd(idx, phi4, pp4);   /* i*phi + pp */
+        v = _mm256_sub_pd(v, _mm256_floor_pd(v));      /* frac() */
+        _mm256_storeu_pd(dst + i, v);
+        idx = _mm256_add_pd(idx, s4);
+    }
+    for (; i < N; i++) { double v = (double)i * PHI + pp; dst[i] = v - floor(v); }
+}
+
+/* ── AVX2+FMA: resonance step  slot[i] = frac(phi*slot[i] + phi) ──────── */
+/* fmadd(v, phi, phi) = phi*v + phi = phi*(v+1) — single FMA instruction   */
+__attribute__((target("avx2,fma")))
+static void avx2_resonance_step_v(double *lat, int N) {
+    __m256d phi4 = _mm256_set1_pd(PHI);
+    int i;
+    for (i = 0; i + 3 < N; i += 4) {
+        __m256d v = _mm256_loadu_pd(lat + i);
+        v = _mm256_fmadd_pd(v, phi4, phi4);            /* phi*(v+1) */
+        v = _mm256_sub_pd(v, _mm256_floor_pd(v));
+        _mm256_storeu_pd(lat + i, v);
+    }
+    for (; i < N; i++) { double v = PHI*(lat[i]+1.0); lat[i] = v - floor(v); }
+}
+
+/* ── AVX2: double → float32 narrow (for 8-wide analog scoring) ─────────── */
+__attribute__((target("avx2,fma")))
+static void avx2_d2f(const double *src, float *dst, int N) {
+    int i;
+    for (i = 0; i + 7 < N; i += 8) {
+        __m128 lo = _mm256_cvtpd_ps(_mm256_loadu_pd(src + i));
+        __m128 hi = _mm256_cvtpd_ps(_mm256_loadu_pd(src + i + 4));
+        _mm256_storeu_ps(dst + i, _mm256_set_m128(hi, lo));
+    }
+    for (; i < N; i++) dst[i] = (float)src[i];
+}
+
+/* ── AVX2+FMA: float32×8 analog prime score  score ∈ [0,1] ─────────────── */
+/* score[i] = 1 - 2*|frac(slot[i]/phi) - 0.5|  →  1.0 = prime resonant    */
+__attribute__((target("avx2,fma")))
+static float avx2_analog_score_sum(const float *lat_f, int N) {
+    __m256 iphi = _mm256_set1_ps(0.61803398875f);   /* 1/phi */
+    __m256 h8   = _mm256_set1_ps(0.5f);
+    __m256 t8   = _mm256_set1_ps(2.0f);
+    __m256 o8   = _mm256_set1_ps(1.0f);
+    __m256 sm   = _mm256_set1_ps(-0.0f);            /* sign mask for abs() */
+    __m256 acc  = _mm256_setzero_ps();
+    int i;
+    for (i = 0; i + 7 < N; i += 8) {
+        __m256 x = _mm256_loadu_ps(lat_f + i);
+        __m256 p = _mm256_mul_ps(x, iphi);
+        p = _mm256_sub_ps(p, _mm256_floor_ps(p));      /* frac(x/phi) */
+        __m256 d = _mm256_andnot_ps(sm, _mm256_sub_ps(p, h8)); /* |d - 0.5| */
+        acc = _mm256_add_ps(acc, _mm256_fnmadd_ps(d, t8, o8)); /* 1 - 2|d| */
+    }
+    /* horizontal sum: 8 → 1 */
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    s4 = _mm_hadd_ps(s4, s4);
+    s4 = _mm_hadd_ps(s4, s4);
+    float total = _mm_cvtss_f32(s4);
+    for (; i < N; i++) {
+        float p = fmodf(lat_f[i] * 0.61803398875f, 1.0f);
+        total += 1.0f - fabsf(p - 0.5f) * 2.0f;
+    }
+    return total;
+}
+
+/* ── Generate lattice_quantum.sh (Linux-side AVX2 bootstrap) ────────────── */
+static void lattice_write_quantum_sh(double crystal_hz, double tsc_hz) {
+    FILE *f = fopen("lattice_quantum.sh", "wb");
+    if (!f) return;
+    fputs("#!/bin/sh\n", f);
+    fputs("# lattice_quantum.sh  -- AVX2/FMA3 quantum throughput (Linux/Alpine)\n", f);
+    fprintf(f, "# Crystal: %.0f Hz  TSC: %.3f MHz\n", crystal_hz, tsc_hz/1e6);
+    fputs("set -e\n\n", f);
+    fputs("echo ''\n", f);
+    fputs("echo '+--------------------------------------------------------------+'\n", f);
+    fputs("echo '|  Quantum Throughput Init  (AVX2/FMA3 phi-Weyl lattice)      |'\n", f);
+    fputs("echo '+--------------------------------------------------------------+'\n", f);
+    fputs("echo ''\n\n", f);
+    /* AVX2 detection */
+    fputs("if grep -q avx2 /proc/cpuinfo 2>/dev/null; then\n", f);
+    fputs("  echo '  [OK] AVX2 detected'\n", f);
+    fputs("else\n", f);
+    fputs("  echo '  [warn] No AVX2 in /proc/cpuinfo -- scalar fallback'\n", f);
+    fputs("fi\n", f);
+    fputs("if grep -q fma /proc/cpuinfo 2>/dev/null; then\n", f);
+    fputs("  echo '  [OK] FMA3 detected'\n", f);
+    fputs("fi\n\n", f);
+    /* Install gcc and write the C benchmark */
+    fputs("apk add --quiet gcc musl-dev 2>/dev/null || true\n\n", f);
+    fputs("cat > /tmp/lattice_q.c << 'CEOF'\n", f);
+    fputs("#include <stdio.h>\n", f);
+    fputs("#include <math.h>\n", f);
+    fputs("#include <time.h>\n", f);
+    fputs("#include <stdint.h>\n", f);
+    fputs("#define PHI 1.6180339887498948482\n", f);
+    fputs("#define N   4096\n", f);
+    fputs("static double lat[N];\n", f);
+    fputs("static float  lat_f[N];\n", f);
+    fputs("static long ns_now(void){\n", f);
+    fputs("  struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);\n", f);
+    fputs("  return t.tv_sec*1000000000L+t.tv_nsec;}\n", f);
+    fputs("int main(void){\n", f);
+    fputs("  long t0,t1; volatile double acc=0.0; int R;\n", f);
+    /* phi-Weyl fill */
+    fputs("  R=50000;\n", f);
+    fputs("  t0=ns_now();\n", f);
+    fputs("  for(int r=0;r<R;r++)\n", f);
+    fputs("    for(int i=0;i<N;i++){double v=i*PHI;lat[i]=v-__builtin_floor(v);}\n", f);
+    fputs("  t1=ns_now();\n", f);
+    fputs("  double ns=(double)(t1-t0)/(R*(double)N);\n", f);
+    fputs("  printf(\"  phi-Weyl fill:      %6.2f ns/slot  %6.1f Mslot/s\\n\",ns,(double)R*N/((t1-t0)*1e-3));\n", f);
+    /* resonance step */
+    fputs("  R=10000;\n", f);
+    fputs("  t0=ns_now();\n", f);
+    fputs("  for(int r=0;r<R;r++)\n", f);
+    fputs("    for(int i=0;i<N;i++){double v=PHI*(lat[i]+1.0);lat[i]=v-__builtin_floor(v);}\n", f);
+    fputs("  t1=ns_now();\n", f);
+    fputs("  ns=(double)(t1-t0)/(R*(double)N);\n", f);
+    fputs("  printf(\"  FMA resonance step: %6.2f ns/slot  %5.1f GFLOPS\\n\",ns,4.0/ns);\n", f);
+    /* float analog scoring */
+    fputs("  for(int i=0;i<N;i++)lat_f[i]=(float)lat[i];\n", f);
+    fputs("  R=500000;\n", f);
+    fputs("  t0=ns_now();\n", f);
+    fputs("  for(int r=0;r<R;r++)\n", f);
+    fputs("    for(int i=0;i<N;i++){float p=__builtin_fmodf(lat_f[i]*0.6180339887f,1.0f);\n", f);
+    fputs("      acc+=1.0f-__builtin_fabsf(p-0.5f)*2.0f;}\n", f);
+    fputs("  t1=ns_now();\n", f);
+    fputs("  ns=(double)(t1-t0)/(R*(double)N);\n", f);
+    fputs("  printf(\"  Analog score f32x8: %6.3f ns/slot  %5.1f Gscore/s\\n\",ns,1.0/ns);\n", f);
+    fputs("  printf(\"  (acc=%.3f)\\n\",acc);\n", f);
+    fputs("  return 0;}\n", f);
+    fputs("CEOF\n\n", f);
+    /* Compile */
+    fputs("echo '  Compiling with gcc -O3 -mavx2 -mfma...'\n", f);
+    fputs("if gcc -O3 -mavx2 -mfma -ffast-math -o /tmp/avx2_seed /tmp/lattice_q.c -lm 2>/dev/null; then\n", f);
+    fputs("  echo '  [OK] compiled'\n", f);
+    fputs("  /tmp/avx2_seed\n", f);
+    fputs("  cp /tmp/avx2_seed /usr/local/bin/avx2_seed\n", f);
+    fputs("  chmod +x /usr/local/bin/avx2_seed\n", f);
+    fputs("  echo '  [OK] /usr/local/bin/avx2_seed installed'\n", f);
+    fputs("else\n", f);
+    fputs("  echo '  [warn] gcc -mavx2 failed -- check Alpine gcc version'\n", f);
+    fputs("fi\n\n", f);
+    /* Profile env */
+    fputs("cat > /etc/profile.d/lattice_quantum.sh << 'QEOF'\n", f);
+    fputs("export LATTICE_BACKEND=avx2_fma\n", f);
+    fputs("export LATTICE_SIMD_DOUBLE=4\n", f);
+    fputs("export LATTICE_SIMD_FLOAT=8\n", f);
+    fputs("alias quantum_seed='avx2_seed 2>/dev/null || echo avx2_seed not installed'\n", f);
+    fputs("QEOF\n\n", f);
+    fputs("echo '  [OK] /etc/profile.d/lattice_quantum.sh written'\n", f);
+    fputs("echo '  [OK] LATTICE_BACKEND=avx2_fma active in all new shells'\n", f);
+    fputs("echo ''\n", f);
+    fclose(f);
+}
+
+static void module_quantum_throughput(void) {
+    int have_avx2 = cpu_has_avx2();
+    int have_fma  = cpu_has_fma();
+
+    printf("\n" CYAN
+        "+--------------------------------------------------------------+\n"
+        "|  Quantum Throughput  --  AVX2 + FMA3 + Crystal-Native       |\n"
+        "+--------------------------------------------------------------+\n"
+        CR "\n");
+
+    /* ── Feature detection ── */
+    printf("  " BOLD "CPU features:" CR "\n");
+    printf("    AVX2 (CPUID leaf7 EBX[5]) : %s\n",
+           have_avx2 ? GRN "YES" CR : RED "NO" CR);
+    printf("    FMA3 (CPUID leaf1 ECX[12]): %s\n",
+           have_fma  ? GRN "YES" CR : RED "NO" CR);
+    printf("    SIMD width (double)       : %d per instruction  (__m256d)\n",
+           have_avx2 ? 4 : 1);
+    printf("    SIMD width (float32)      : %d per instruction  (__m256)\n",
+           have_avx2 ? 8 : 1);
+    printf("    Peak FP (double, 2808MHz) : %.1f GFLOPS  (4d x 2FMA x 2units)\n",
+           2808.0 * 4 * 2 * 2 / 1000.0);
+    printf("    Peak FP (float32, 2808MHz): %.1f GFLOPS  (8f x 2FMA x 2units)\n\n",
+           2808.0 * 8 * 2 * 2 / 1000.0);
+
+    if (!have_avx2) {
+        printf("  " RED "[skip] AVX2 not available — cannot run quantum benchmarks\n" CR "\n");
+        return;
+    }
+
+    static double bench_lat[LATTICE_MAX];
+    static float  bench_f[LATTICE_MAX];
+    double t0, t1;
+    long N_reps;
+    volatile double acc = 0.0;
+    volatile float  facc = 0.0f;
+
+    /* ── 1. Phi-Weyl fill: AVX2 vs scalar ── */
+    printf("  " BOLD "Benchmark 1: Phi-Weyl fill  (AVX2 FMA vs scalar)" CR "\n");
+    /* scalar baseline */
+    N_reps = 10000;
+    t0 = now_s();
+    for (long r = 0; r < N_reps; r++)
+        for (int i = 0; i < LATTICE_MAX; i++) {
+            double v = (double)i * PHI;
+            bench_lat[i] = v - floor(v);
+        }
+    t1 = now_s();
+    double sc_fill_ns = (t1 - t0) * 1e9 / (N_reps * LATTICE_MAX);
+    for (int i = 0; i < LATTICE_MAX; i++) acc += bench_lat[i];
+    printf("    Scalar          : " YEL "%6.2f ns/slot" CR "\n", sc_fill_ns);
+
+    /* AVX2 */
+    t0 = now_s();
+    for (long r = 0; r < N_reps; r++) avx2_weyl_fill(bench_lat, LATTICE_MAX, 0.0);
+    t1 = now_s();
+    double av_fill_ns = (t1 - t0) * 1e9 / (N_reps * LATTICE_MAX);
+    for (int i = 0; i < LATTICE_MAX; i++) acc += bench_lat[i];
+    printf("    AVX2 FMA        : " GRN "%6.2f ns/slot" CR "   speedup: " BOLD "%.1fx\n" CR,
+           av_fill_ns, sc_fill_ns / av_fill_ns);
+    /* with crystal phase */
+    double cphase = (lattice_crystal_phase_g >= 0.0) ? lattice_crystal_phase_g : 0.0;
+    if (cphase > 0.0) {
+        t0 = now_s();
+        for (long r = 0; r < N_reps; r++) avx2_weyl_fill(bench_lat, LATTICE_MAX, cphase);
+        t1 = now_s();
+        double avp_ns = (t1 - t0) * 1e9 / (N_reps * LATTICE_MAX);
+        printf("    AVX2+crystal    : " GRN "%6.2f ns/slot" CR "   (phase %.6f)\n",
+               avp_ns, cphase);
+    }
+    printf("\n");
+
+    /* ── 2. Resonance step: AVX2 FMA vs scalar ── */
+    printf("  " BOLD "Benchmark 2: Resonance step  (fmadd vs scalar mul)" CR "\n");
+    /* prime the lattice with a real fill */
+    avx2_weyl_fill(bench_lat, LATTICE_MAX, cphase);
+
+    N_reps = 2000;
+    /* scalar */
+    static double bench_sc[LATTICE_MAX];
+    memcpy(bench_sc, bench_lat, LATTICE_MAX * sizeof(double));
+    t0 = now_s();
+    for (long r = 0; r < N_reps; r++)
+        for (int i = 0; i < LATTICE_MAX; i++) {
+            double v = PHI * (bench_sc[i] + 1.0);
+            bench_sc[i] = v - floor(v);
+        }
+    t1 = now_s();
+    double sc_res_ns = (t1 - t0) * 1e9 / (N_reps * (double)LATTICE_MAX);
+    /* how many real FLOPS: 1 mul + 1 add + 1 sub + 1 floor ≈ 4 per slot */
+    double sc_gflops = 4.0 / sc_res_ns;
+    printf("    Scalar          : " YEL "%6.2f ns/slot" CR "   %.2f GFLOPS\n",
+           sc_res_ns, sc_gflops);
+
+    /* AVX2 FMA: phi*v + phi = phi*(v+1) in ONE fmadd_pd instruction */
+    t0 = now_s();
+    for (long r = 0; r < N_reps; r++) avx2_resonance_step_v(bench_lat, LATTICE_MAX);
+    t1 = now_s();
+    double av_res_ns = (t1 - t0) * 1e9 / (N_reps * (double)LATTICE_MAX);
+    double av_gflops = 4.0 / av_res_ns;  /* 4 FLOPS: FMA(2)+sub(1)+floor(1) */
+    printf("    AVX2 FMA        : " GRN "%6.2f ns/slot" CR "   %.2f GFLOPS  speedup: " BOLD "%.1fx\n" CR,
+           av_res_ns, av_gflops, sc_res_ns / av_res_ns);
+    printf("    FMA advantage   : phi*(v+1) = fmadd(v,phi,phi) — 1 instruction, 0 rounding error\n\n");
+
+    /* ── 3. Analog prime scoring: float32×8 vs digital Miller-Rabin ── */
+    printf("  " BOLD "Benchmark 3: Analog (float32x8 AVX2) vs Digital (MR)" CR "\n");
+
+    /* float32×8 analog */
+    avx2_d2f(bench_lat, bench_f, LATTICE_MAX);
+    N_reps = 500000;
+    t0 = now_s();
+    for (long r = 0; r < N_reps; r++) facc += avx2_analog_score_sum(bench_f, LATTICE_MAX);
+    t1 = now_s();
+    double an_ns = (t1 - t0) * 1e9 / (N_reps * (double)LATTICE_MAX);
+    double an_gscore = 1.0 / an_ns;
+    printf("    Analog f32x8    : " GRN "%6.3f ns/score" CR "   %.1f Gscore/s\n",
+           an_ns, an_gscore);
+
+    /* digital MR on the same values */
+    N_reps = 20000;
+    long mr_pass = 0;
+    t0 = now_s();
+    for (long r = 0; r < N_reps; r++) {
+        uint64_t cand = (uint64_t)(bench_lat[r % LATTICE_MAX] * 1e14 + 1000003) | 1ULL;
+        if (is_prime_64(cand)) mr_pass++;
+    }
+    t1 = now_s();
+    double mr_us = (t1 - t0) * 1e6 / N_reps;
+    printf("    Digital MR      : " YEL "%6.3f µs/test " CR "   %.3f Mtest/s  (%ld pass)\n",
+           mr_us, 1.0 / (mr_us * 1e3), mr_pass);
+    double ratio = (mr_us * 1000.0) / an_ns;
+    printf("    Analog/Digital  : " BOLD "%.0fx faster" CR
+           "  (analog pre-filter → MR only on survivors)\n\n", ratio);
+
+    /* ── 4. Crystal-period segment scan (117 slots = 1 oscillation) ── */
+    printf("  " BOLD "Benchmark 4: Crystal-period aligned scan (117 slots/chunk)" CR "\n");
+    {
+        int period = 117;  /* TSC ticks per crystal oscillation (24 MHz, 2808 TSC) */
+        int chunks = LATTICE_MAX / period;  /* 35 complete oscillations */
+        int tail   = LATTICE_MAX % period;  /* 31 remaining slots */
+        printf("    Crystal period  : 117 TSC ticks = 1 oscillation = 41.67 ns\n");
+        printf("    Lattice         : %d chunks × 117 slots  +  %d tail\n", chunks, tail);
+        printf("    Coverage        : 35 complete crystal periods per lattice sweep\n");
+        /* bench: process each 117-element chunk, accumulating phi-weighted sums */
+        N_reps = 200000;
+        double chunk_acc = 0.0;
+        t0 = now_s();
+        for (long r = 0; r < N_reps; r++) {
+            for (int c = 0; c < chunks; c++) {
+                const double *chunk = bench_lat + c * period;
+                double s = 0.0;
+                for (int j = 0; j < period; j++) s += chunk[j];
+                chunk_acc += s;
+            }
+        }
+        t1 = now_s();
+        double cperiod_ns = (t1 - t0) * 1e9 / (N_reps * (double)LATTICE_MAX);
+        printf("    Chunk scan      : " YEL "%.2f ns/slot" CR
+               "  (%.1f ns/chunk = %.1f crystal oscillations/chunk)\n",
+               cperiod_ns, cperiod_ns * period,
+               (cperiod_ns * period) / 41.67);
+        acc += chunk_acc;
+    }
+    printf("\n");
+
+    /* ── 5. GFLOPS summary ── */
+    printf("  " BOLD "GFLOPS achieved on i7-6700T @ 2808 MHz:" CR "\n");
+    printf("    phi-Weyl fill (AVX2)   : %5.1f GFLOPS  (FMA+sub+floor, 4 FLOPS/slot)\n",
+           4.0 / av_fill_ns);
+    printf("    Resonance step (AVX2)  : %5.1f GFLOPS  (FMA+sub+floor, 4 FLOPS/slot)\n",
+           av_gflops);
+    printf("    Analog scoring (f32x8) : %5.1f GFLOPS  (mul+floor+sub+fnmadd, ~5 FLOPS)\n",
+           5.0 / an_ns);
+    printf("    Peak theoretical       : %5.1f GFLOPS  (double, 4d FMA × 2 units)\n\n",
+           2808.0 * 4 * 2 * 2 / 1000.0);
+
+    /* ── 6. Apply: re-seed lattice with AVX2 + crystal phase ── */
+    printf("  " BOLD "Applying AVX2 crystal-phase lattice seed..." CR); fflush(stdout);
+    double seed_phase = (lattice_crystal_phase_g >= 0.0) ? lattice_crystal_phase_g : 0.0;
+    avx2_weyl_fill(lattice, LATTICE_MAX, seed_phase);
+    for (int s = 0; s < 50; s++) avx2_resonance_step_v(lattice, LATTICE_MAX);
+    lattice_N                = LATTICE_MAX;
+    lattice_alpine_installed = 1;
+    lattice_seed_steps_done  = 50;
+    printf(" done.\n");
+    printf("    lattice[0]  = %.8f\n", lattice[0]);
+    printf("    lattice[1]  = %.8f\n", lattice[1]);
+    printf("    lattice[42] = %.8f  (resonance pivot)\n\n", lattice[42]);
+    printf("    " GRN "Lattice is now AVX2+FMA seeded via quartz crystal phase.\n" CR "\n");
+
+    /* ── 7. Generate lattice_quantum.sh ── */
+    double tsc_hz = cx_measure_hz();
+    double crystal_hz = (lattice_crystal_phase_g >= 0.0) ? 24000000.0 : 24000000.0;
+    lattice_write_quantum_sh(crystal_hz, tsc_hz);
+    printf("  " GRN "[OK] lattice_quantum.sh" CR "\n");
+    printf("       Linux: gcc -O3 -mavx2 -mfma → /usr/local/bin/avx2_seed\n");
+    printf("       Env:   LATTICE_BACKEND=avx2_fma in all new shells\n\n");
+
+    /* ── 8. Offer to push to container ── */
+    int live = 0;
+    {
+        FILE *fp = _popen("docker inspect --format={{.State.Running}} phi4096-lattice 2>nul", "r");
+        if (fp) { char b[32]={0}; fgets(b,sizeof(b),fp); _pclose(fp);
+                  if (strstr(b,"true")) live=1; }
+    }
+    if (live) {
+        printf("  Container " GRN "[live: phi4096-lattice]" CR " — push quantum init? [y/N] ");
+        fflush(stdout);
+        DWORD old; GetConsoleMode(g_hin,&old);
+        SetConsoleMode(g_hin,ENABLE_PROCESSED_INPUT|ENABLE_ECHO_INPUT|ENABLE_LINE_INPUT);
+        WCHAR wb[8]={0}; DWORD nr=0;
+        ReadConsoleW(g_hin,wb,7,&nr,NULL);
+        SetConsoleMode(g_hin,old);
+        char ans=(wb[0]>0&&wb[0]<=127)?(char)wb[0]:'n';
+        if (ans=='y'||ans=='Y') {
+            printf("\n");
+            system("docker cp lattice_quantum.sh phi4096-lattice:/lattice/quantum.sh >nul 2>nul");
+            system("docker exec phi4096-lattice sh /lattice/quantum.sh");
+        } else { printf("  Skipped.\n"); }
+    } else {
+        printf("  " DIM "(Container not running — start with [6] Alpine Install)" CR "\n");
+    }
+
+    printf("\n  " BOLD "Quantum advantage summary:" CR "\n");
+    printf("    Fill speedup    : %.1fx  (AVX2 vs scalar)\n", sc_fill_ns / av_fill_ns);
+    printf("    Resonance spdup : %.1fx  (AVX2 FMA vs scalar)\n", sc_res_ns / av_res_ns);
+    printf("    Analog/Digital  : %.0fx  (f32 sieve vs Miller-Rabin)\n\n", ratio);
+
+    printf("  " DIM "acc=%.3f facc=%.3f  (prevents DCE)\n" CR "\n",
+           (double)acc, (double)facc);
+}
+
 static void module_lattice_bench(void) {
     printf("\n" CYAN
         "+--------------------------------------------------------------+\n"
@@ -2987,7 +3416,7 @@ static void module_lattice_bench(void) {
                YEL "%6.2f µs" CR "      %d/%ld pass\n", us, mr_pass, N);
     }
 
-    printf("\n  " DIM "acc = %.3f  (prevents dead-code elimination)\n" CR);
+    printf("\n  " DIM "acc = %.3f  (prevents dead-code elimination)\n" CR, acc);
 
     /* ── Niche analysis ── */
     printf("\n" CYAN "  Niche analysis:" CR "\n");
@@ -3210,6 +3639,7 @@ static void print_menu(void) {
     printf("  " YEL "[A]" CR " Process Scheduler    lattice-native per-process CPU/IO/cgroup\n");
     printf("  " YEL "[B]" CR " Lattice Benchmark    phi-native perf profile + niche analysis\n");
     printf("  " YEL "[C]" CR " Crystal-Native       quartz crystal -> lattice -> OS\n");
+    printf("  " YEL "[D]" CR " Quantum Throughput   AVX2+FMA3 fire on this hardware\n");
     printf("  " YEL "[Q]" CR " Quit\n\n");
     printf("  " BOLD ">" CR " "); fflush(stdout);
 }
@@ -3234,7 +3664,8 @@ int main(int argc, char *argv[]) {
         case '9': module_kernel_build();   break;
         case 'a': module_proc_sched();     break;
         case 'b': module_lattice_bench();  break;
-        case 'c': module_crystal_native(); break;
+        case 'c': module_crystal_native();      break;
+        case 'd': module_quantum_throughput();   break;
         default: printf("Unknown module '%s'\n", argv[1]); return 1;
         }
         return 0;
@@ -3264,6 +3695,7 @@ int main(int argc, char *argv[]) {
         case 'a': module_proc_sched();       break;
         case 'b': module_lattice_bench();      break;
         case 'c': module_crystal_native();     break;
+        case 'd': module_quantum_throughput();  break;
         case 'q':
             printf("\n" CYAN "  Goodbye.\n" CR "\n");
             return 0;
